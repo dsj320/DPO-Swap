@@ -1,0 +1,6 @@
+FID score with Dataset:
+Limiting evaluation to first 1000 samples (out of 30000)
+FID:  7.634668441696462
+ID similarity with Source using Arcface:
+Pose comarison with target:
+Expression comarison with target:

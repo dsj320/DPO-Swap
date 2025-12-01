@@ -1,0 +1,152 @@
+model:
+  base_learning_rate: 1.0e-06
+  target: ldm.models.diffusion.ddpm_dpo.LatentDiffusion
+  params:
+    linear_start: 0.00085
+    linear_end: 0.0120
+    num_timesteps_cond: 1
+    log_every_t: 200
+    timesteps: 1000
+    first_stage_key: "inpaint"
+    cond_stage_key: "image"
+    image_size: 64
+    channels: 4
+    cond_stage_trainable: true   # Note: different from the one we trained before
+    conditioning_key: crossattn
+    monitor: train/loss_epoch
+    u_cond_percent: 0.2
+    scale_factor: 0.18215
+    use_ema: False
+    ref_ckpt_path: /data5/shuangjun.du/work/REFace/last.ckpt
+    dpo_beta: 5000  # DPO 超参数，控制奖励函数的强度
+    
+    # DPO 辅助损失配置
+    use_auxiliary_losses: False         # 是否使用辅助损失
+    aux_diffusion_weight: 1.0          # 扩散重构损失权重（对赢样本）
+    aux_id_loss_weight: 0.3            # ID 损失权重
+    aux_lpips_loss_weight: 0.1         # 感知损失权重（对赢样本）
+    aux_reconstruct_ddim_steps: 4      # 重构的 DDIM 步数
+    dpo_loss_weight: 0              # DPO 损失权重
+
+    scheduler_config: # 10000 warmup steps
+      target: ldm.lr_scheduler.LambdaLinearScheduler
+      params:
+        warm_up_steps: [ 10000 ]
+        cycle_lengths: [ 10000000000000 ] # incredibly large number to prevent corner cases
+        f_start: [ 1.e-6 ]
+        f_max: [ 1. ]
+        f_min: [ 1. ]
+
+    unet_config:
+      target: ldm.modules.diffusionmodules.openaimodel.UNetModel
+      params:
+        image_size: 32 # unused
+        in_channels: 9
+        out_channels: 4
+        model_channels: 320
+        attention_resolutions: [ 4, 2, 1 ]
+        num_res_blocks: 2
+        channel_mult: [ 1, 2, 4, 4 ]
+        num_heads: 8
+        use_spatial_transformer: True
+        transformer_depth: 1
+        context_dim: 768
+        use_checkpoint: True
+        legacy: False
+        add_conv_in_front_of_unet: False
+
+    first_stage_config:
+      target: ldm.models.autoencoder.AutoencoderKL
+      params:
+        embed_dim: 4
+        monitor: val/rec_loss
+        ddconfig:
+          double_z: true
+          z_channels: 4
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult:
+          - 1
+          - 2
+          - 4
+          - 4
+          num_res_blocks: 2
+          attn_resolutions: []
+          dropout: 0.0
+        lossconfig:
+          target: torch.nn.Identity
+
+    cond_stage_config:
+      target: ldm.modules.encoders.modules.FrozenCLIPEmbedder
+      other_params:
+        clip_weight: 1.0
+        ID_weight: 10.0
+        Landmark_cond: True
+        Landmarks_weight: 0.05
+        arcface_path: "Other_dependencies/arcface/model_ir_se50.pth"
+        concat_feat: False
+        land_mark_id_seperate_layers: False
+        multi_scale_ID: False # True was used for the previous training there is an issue
+        sep_head_att: False
+        Additional_config:
+          Reconstruct_initial: True
+          Target_CLIP_feat: True
+          Source_CLIP_feat: True
+          Multiple_ID_losses: True
+          Reconstruct_DDIM_steps: 4
+          ID_loss_weight: 0.3
+          LPIPS_loss_weight: 0.1
+          Landmark_loss_weight: 0
+        
+      
+
+data:
+  target: main.DataModuleFromConfig
+  params:
+      batch_size: 3
+      wrap: False
+      train:
+          target: ldm.data.dpo_dataset.DPOFaceDataset
+          params:
+              data_manifest_path: /data5/shuangjun.du/work/data_filter/dpo_data_filtered.json
+              args:
+                  state: train
+                  arbitrary_mask_percent: 0.5
+                  image_size: 512
+                  data_seed: 42
+                  gray_outer_mask: True
+                  remove_mask_tar: [1,2,4,5,8,9 ,6,7,10,11,12,17 ]
+                  preserve_mask_src: [1,2,4,5,8,9 ,6,7,10,11,12,17 ]
+      validation:
+           target: ldm.data.test_bench_dataset.CelebAdataset
+           params:
+              state: test
+              dataset_dir: dataset/FaceData/CelebAMask-HQ/
+              image_size: 512
+              gray_outer_mask: True
+              remove_mask_tar: [1,2,4,5,8,9 ,6,7,10,11,12,17 ]
+              preserve_mask_src: [1,2,4,5,8,9 ,6,7,10,11,12,13,17 ]
+      test:
+          target: ldm.data.celebA.CelebAdataset
+          params:
+              state: test
+              dataset_dir: dataset/FaceData/CelebAMask-HQ/
+              arbitrary_mask_percent: 0.5
+              image_size: 512
+              gray_outer_mask: True
+              remove_mask_tar: [1,2,4,5,8,9 ,6,7,10,11,12,17 ]
+              preserve_mask_src: [1,2,4,5,8,9 ,6,7,10,11,12,13,17 ]
+lightning:
+  wandb:
+    project: "Face_Swapping_DPO"  # wandb 项目名称
+    run_name: null  # 运行名称，null表示自动生成（时间戳+配置名）
+    tags: ["dpo", "face-swap"]  # 标签，便于过滤
+    notes: "DPO training for face swapping"  # 运行说明
+  trainer:
+    max_epochs: 20
+    num_nodes: 1
+    accelerator: 'gpu'
+    gpus: "0,1" #可见的gpu中选择哪些
+  

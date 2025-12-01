@@ -1,0 +1,8 @@
+{
+  "FID": 5.909616415417446,
+  "ID_Top1_Accuracy": 96.1,
+  "ID_Top5_Accuracy": 98.8,
+  "ID_Mean_Similarity": 0.65,
+  "Pose_Error": 3.567360487950524,
+  "Expression_Error": 1.013751612768818
+}

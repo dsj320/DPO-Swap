@@ -1,0 +1,43 @@
+# 忽略权重模型文件 (太大了，不传)
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+*.h5
+*.onnx
+*.msgpack
+*.zip
+*.wandb
+*.incomplete
+last.ckpt
+
+# 忽略数据集和图片 (非代码，不传)
+*.jpg
+*.png
+*.jpeg
+*.mp4
+/data/
+/datasets/
+
+/examples/
+# 忽略 Python 编译缓存和环境 (垃圾文件，不传)
+__pycache__/
+*.pyc
+.env
+/venv/
+.idea/
+.vscode/
+
+# 忽略日志和输出
+/logs/
+/models/
+/results/
+*.log
+*.mat
+
+# 忽略超大模型文件（超过 GitHub 限制）
+Other_dependencies/DLIB_landmark_det/*.dat
+Other_dependencies/Hopenet_pose/*.pkl
+eval_tool/Deep3DFaceRecon_pytorch_edit/BFM/*.mat
+
