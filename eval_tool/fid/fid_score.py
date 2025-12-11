@@ -1,29 +1,6 @@
-"""Calculates the Frechet Inception Distance (FID) to evalulate GANs
-The FID metric calculates the distance between two distributions of images.
-Typically, we have summary statistics (mean & covariance matrix) of one
-of these distributions, while the 2nd distribution is given by a GAN.
-When run as a stand-alone program, it compares the distribution of
-images that are stored as PNG/JPEG at a specified location with a
-distribution given by summary statistics (in pickle format).
-The FID is calculated by assuming that X_1 and X_2 are the activations of
-the pool_3 layer of the inception net for generated samples and real world
-samples respectively.
-See --help to see further details.
-Code apapted from https://github.com/bioinf-jku/TTUR to use PyTorch instead
-of Tensorflow
-Copyright 2018 Institute of Bioinformatics, JKU Linz
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-   http://www.apache.org/licenses/LICENSE-2.0
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
 import os
 import pathlib
+import hashlib
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 
 import numpy as np
@@ -55,7 +32,15 @@ parser.add_argument('--dims', type=int, default=2048,
                     help=('Dimensionality of Inception features to use. '
                           'By default, uses pool3 features'))
 parser.add_argument('--max-samples', type=int, default=None,
-                    help='Maximum number of samples to evaluate. If None, evaluate all samples.')
+                    help='Maximum number of generated samples to evaluate (does not apply to real images). If None, evaluate all generated samples.')
+parser.add_argument('--stats-dir', type=str, default=None,
+                    help=('Directory to save/load precomputed statistics. '
+                          'If None, statistics will be saved in a .fid_stats subdirectory '
+                          'next to the image directory'))
+parser.add_argument('--save-stats', action='store_true',
+                    help='Force save statistics even if cache exists')
+parser.add_argument('--output', type=str, default=None,
+                    help='Path to output text file to save FID score. If not specified, only print to console.')
 parser.add_argument('path', type=str, nargs=2,
                     default=['dataset/FaceData/CelebAMask-HQ/CelebA-HQ-img', 'results/test_bench/results'],
                     help=('Paths to the generated images or '
@@ -216,39 +201,153 @@ def calculate_activation_statistics(files, model, batch_size=50, dims=2048,
     return mu, sigma
 
 
+def get_stats_cache_path(image_path, max_samples, dims, stats_dir=None):
+    """Generate cache file path for statistics.
+    
+    Args:
+        image_path: Path to image directory
+        max_samples: Maximum number of samples (None means all)
+        dims: Feature dimensionality
+        stats_dir: Directory to save stats (None means use default)
+    
+    Returns:
+        Path to cache file
+    """
+    path_obj = pathlib.Path(image_path)
+    
+    # Generate a unique identifier based on path, max_samples, and dims
+    try:
+        path_str = str(path_obj.resolve())
+    except (OSError, RuntimeError):
+        # If resolve fails, use the absolute path as is
+        path_str = str(path_obj.absolute())
+    
+    cache_key = f"{path_str}_{max_samples}_{dims}"
+    cache_hash = hashlib.md5(cache_key.encode()).hexdigest()[:12]
+    
+    # Determine stats directory
+    if stats_dir is None:
+        # Use .fid_stats subdirectory next to the image directory
+        if path_obj.exists():
+            stats_dir = path_obj.parent / '.fid_stats'
+        else:
+            # If path doesn't exist, use current directory
+            stats_dir = pathlib.Path('.') / '.fid_stats'
+    else:
+        stats_dir = pathlib.Path(stats_dir)
+    
+    # Create stats directory if it doesn't exist
+    stats_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Generate cache filename
+    path_name = path_obj.name or 'root'
+    cache_filename = f"{path_name}_{cache_hash}.npz"
+    cache_path = stats_dir / cache_filename
+    
+    return cache_path
+
+
 def compute_statistics_of_path(path, model, batch_size, dims, device,
-                               num_workers=1, max_samples=None):
+                               num_workers=1, max_samples=None, 
+                               stats_dir=None, save_stats=False):
+    """Compute statistics for a path, with automatic caching.
+    
+    Args:
+        path: Path to image directory or .npz file
+        model: Model instance
+        batch_size: Batch size
+        dims: Feature dimensionality
+        device: Device to use
+        num_workers: Number of workers
+        max_samples: Maximum number of samples
+        stats_dir: Directory to save/load cached statistics 
+                   (None means use default location, False means disable caching)
+        save_stats: Force save statistics even if cache exists
+    
+    Returns:
+        Tuple of (mu, sigma) statistics
+    """
     if path.endswith('.npz'):
+        # Directly load from .npz file
         with np.load(path) as f:
             m, s = f['mu'][:], f['sigma'][:]
-    else:
-        path = pathlib.Path(path)
-        files = sorted([file for ext in IMAGE_EXTENSIONS
-                       for file in path.glob('*.{}'.format(ext))])
-        # 限制评估样本数量
-        if max_samples is not None and len(files) > max_samples:
-            files = files[:max_samples]
-            print(f"Limiting evaluation to first {max_samples} samples (out of {len(sorted([file for ext in IMAGE_EXTENSIONS for file in path.glob('*.{}'.format(ext))]))})")
-        m, s = calculate_activation_statistics(files, model, batch_size,
-                                               dims, device, num_workers)
-
+        return m, s
+    
+    # Path to image directory
+    image_path = pathlib.Path(path)
+    
+    # Generate cache file path only if caching is enabled
+    cache_path = None
+    if stats_dir is not False:  # False means disable caching
+        cache_path = get_stats_cache_path(str(image_path), max_samples, dims, stats_dir)
+        
+        # Try to load from cache if it exists and we're not forcing save
+        if not save_stats and cache_path.exists():
+            print(f"Loading cached statistics from: {cache_path}")
+            with np.load(cache_path) as f:
+                m, s = f['mu'][:], f['sigma'][:]
+            return m, s
+    
+    # Compute statistics
+    files = sorted([file for ext in IMAGE_EXTENSIONS
+                   for file in image_path.glob('*.{}'.format(ext))])
+    
+    # 限制评估样本数量
+    total_files = len(files)
+    if max_samples is not None and len(files) > max_samples:
+        files = files[:max_samples]
+        print(f"Limiting evaluation to first {max_samples} samples (out of {total_files})")
+    
+    print(f"Computing statistics for {len(files)} images...")
+    m, s = calculate_activation_statistics(files, model, batch_size,
+                                           dims, device, num_workers)
+    
+    # Save statistics to cache if caching is enabled
+    if cache_path is not None:
+        print(f"Saving statistics to cache: {cache_path}")
+        np.savez(cache_path, mu=m, sigma=s)
+    
     return m, s
 
 
-def calculate_fid_given_paths(paths, batch_size, device, dims, num_workers=1, max_samples=None):
-    """Calculates the FID of two paths"""
+def calculate_fid_given_paths(paths, batch_size, device, dims, num_workers=1, 
+                              max_samples=None, stats_dir=None, save_stats=False,
+                              cache_first_only=True):
+    """Calculates the FID of two paths
+    
+    Args:
+        paths: List of two paths (real images, generated images)
+        max_samples: Maximum number of generated images to evaluate (does NOT apply to real images)
+        cache_first_only: If True, only cache statistics for the first path (real images)
+    """
     for p in paths:
-        if not os.path.exists(p):
+        if not os.path.exists(p) and not p.endswith('.npz'):
             raise RuntimeError('Invalid path: %s' % p)
 
     block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[dims]
 
     model = InceptionV3([block_idx]).to(device)
 
+    # Compute statistics for first path (real images) - always use caching
+    # max_samples does NOT apply to real images - always use all samples
     m1, s1 = compute_statistics_of_path(paths[0], model, batch_size,
-                                        dims, device, num_workers, max_samples)
-    m2, s2 = compute_statistics_of_path(paths[1], model, batch_size,
-                                        dims, device, num_workers, max_samples)
+                                        dims, device, num_workers, None,  # None = use all samples
+                                        stats_dir, save_stats)
+    
+    # Compute statistics for second path (generated images)
+    # max_samples only applies to generated images
+    # By default, only cache the first path (real images) to save time
+    # since generated images change frequently
+    if cache_first_only:
+        # Disable caching for generated images
+        m2, s2 = compute_statistics_of_path(paths[1], model, batch_size,
+                                            dims, device, num_workers, max_samples,  # Apply max_samples here
+                                            False, False)  # stats_dir=False disables caching
+    else:
+        m2, s2 = compute_statistics_of_path(paths[1], model, batch_size,
+                                            dims, device, num_workers, max_samples,  # Apply max_samples here
+                                            stats_dir, save_stats)
+    
     fid_value = calculate_frechet_distance(m1, s1, m2, s2)
 
     return fid_value
@@ -273,9 +372,52 @@ def main():
                                           device,
                                           args.dims,
                                           num_workers,
-                                          args.max_samples)
-    print('FID: ', fid_value)
+                                          args.max_samples,
+                                          args.stats_dir,
+                                          args.save_stats)
+    
+    # 输出结果到控制台
+    result_str = f'FID: {fid_value:.6f}'
+    print(result_str)
+    
+    # 如果指定了输出文件，保存结果到文件
+    if args.output:
+        output_path = pathlib.Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(output_path, 'w') as f:
+            f.write(f"FID Score Evaluation Results\n")
+            f.write(f"{'='*60}\n")
+            f.write(f"Real images path: {args.path[0]}\n")
+            f.write(f"Generated images path: {args.path[1]}\n")
+            f.write(f"Batch size: {args.batch_size}\n")
+            f.write(f"Feature dimensions: {args.dims}\n")
+            f.write(f"Max samples (generated only): {args.max_samples if args.max_samples else 'All'}\n")
+            f.write(f"Note: max_samples only applies to generated images, not real images.\n")
+            f.write(f"{'='*60}\n")
+            f.write(f"\nFID Score: {fid_value:.6f}\n")
+        
+        print(f"FID score saved to: {output_path}")
 
 
 if __name__ == '__main__':
     main()
+
+
+"""
+
+CUDA_VISIBLE_DEVICES=3
+python /data5/shuangjun.du/work/REFace/eval_tool/fid/fid_score.py \
+    /data5/shuangjun.du/work/REFace/dataset/FaceData/CelebAMask-HQ/CelebA-HQ-img \
+    /data5/shuangjun.du/work/REFace/results/CelebA/REFace/results \
+    --max-samples 200 \
+    --output tmp/fid_score_celeba_200.txt
+
+
+CUDA_VISIBLE_DEVICES=3
+python /data5/shuangjun.du/work/REFace/eval_tool/fid/fid_score.py \
+    /data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/images512 \
+    /data5/shuangjun.du/work/REFace/results/FFHQ/REFace/results\
+    --max-samples 200 \
+    --output tmp/fid_score_ffhq_200.txt 
+"""

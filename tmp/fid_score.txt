@@ -1,0 +1,11 @@
+FID Score Evaluation Results
+============================================================
+Real images path: /data5/shuangjun.du/work/REFace/dataset/FaceData/CelebAMask-HQ/CelebA-HQ-img
+Generated images path: /data5/shuangjun.du/work/REFace/results/CelebA/REFace/results
+Batch size: 50
+Feature dimensions: 2048
+Max samples (generated only): 100
+Note: max_samples only applies to generated images, not real images.
+============================================================
+
+FID Score: 19.70

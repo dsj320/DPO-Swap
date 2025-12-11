@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import numpy as np
@@ -499,16 +500,16 @@ class DDPM(pl.LightningModule):
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
         pass
-        # _, loss_dict_no_ema = self.shared_step(batch)
-        # with self.ema_scope():
-        #     _, loss_dict_ema = self.shared_step(batch)
-        #     loss_dict_ema = {key + '_ema': loss_dict_ema[key] for key in loss_dict_ema}
-        # self.log_dict(loss_dict_no_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
-        # self.log_dict(loss_dict_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
 
     def on_train_batch_end(self, *args, **kwargs):
         if self.use_ema:
             self.model_ema(self.model)
+        
+        # 在特定step进行测试
+        if (hasattr(self, 'test_during_training') and self.test_during_training and 
+            hasattr(self, 'test_interval_steps') and 
+            self.global_step > 0 and self.global_step % self.test_interval_steps == 0):
+            self.run_test_during_training()
 
     def _get_rows_from_list(self, samples):
         n_imgs_per_row = len(samples)
@@ -594,6 +595,7 @@ class LatentDiffusion(DDPM):
         
         # 在调用父类 __init__ 之前，先提取 DPO 特有的参数
         # 这些参数父类 DDPM 不接受，需要先从 kwargs 中移除
+        use_sft_loss = kwargs.pop('use_sft_loss', False)  # ⭐ 新增：是否使用SFT loss（False=使用DPO）
         use_auxiliary_losses = kwargs.pop('use_auxiliary_losses', False)
         aux_diffusion_weight = kwargs.pop('aux_diffusion_weight', 1.0)
         aux_id_loss_weight = kwargs.pop('aux_id_loss_weight', 0.3)
@@ -601,38 +603,71 @@ class LatentDiffusion(DDPM):
         aux_reconstruct_ddim_steps = kwargs.pop('aux_reconstruct_ddim_steps', 4)
         dpo_loss_weight = kwargs.pop('dpo_loss_weight', 1.0)
         
+        # 训练时测试的配置（需要在调用父类之前移除，避免传递给父类）
+        test_during_training = kwargs.pop('test_during_training', False)  # 是否在训练时进行测试
+        test_interval_steps = kwargs.pop('test_interval_steps', 1000)  # 每N步测试一次
+        test_num_samples = kwargs.pop('test_num_samples', 200)  # 测试时生成的样本数
+        test_dataset_name = kwargs.pop('test_dataset_name', 'celeba')  # 测试数据集名称
+        test_source_path = kwargs.pop('test_source_path', None)  # 测试源图像路径
+        test_target_path = kwargs.pop('test_target_path', None)  # 测试目标图像路径
+        test_source_mask_path = kwargs.pop('test_source_mask_path', None)  # 测试源mask路径
+        test_target_mask_path = kwargs.pop('test_target_mask_path', None)  # 测试目标mask路径
+        test_dataset_path = kwargs.pop('test_dataset_path', None)  # 测试数据集路径（用于FID）
+        test_batch_size = kwargs.pop('test_batch_size', 4)  # 测试时的batch size
+        test_guidance_scale = kwargs.pop('test_guidance_scale', 3.0)  # 测试时的guidance scale（参考inference_test_bench.sh，默认3.0）
+        test_ddim_steps = kwargs.pop('test_ddim_steps', 50)  # 测试时的DDIM采样步数（参考inference_test_bench.sh，默认50）
+        
         super().__init__(unet_config, conditioning_key=conditioning_key, *args, **kwargs)
 
+        # 设置训练时测试的配置
+        self.test_during_training = test_during_training
+        self.test_interval_steps = test_interval_steps
+        self.test_num_samples = test_num_samples
+        self.test_dataset_name = test_dataset_name
+        self.test_source_path = test_source_path
+        self.test_target_path = test_target_path
+        self.test_source_mask_path = test_source_mask_path
+        self.test_target_mask_path = test_target_mask_path
+        self.test_dataset_path = test_dataset_path
+        self.test_batch_size = test_batch_size
+        self.test_guidance_scale = test_guidance_scale
+        self.test_ddim_steps = test_ddim_steps
+        self.test_guidance_scale = test_guidance_scale
 
         #---------------------DPO---------------------------------
-
-        print(f"DPO: 正在实例化参考模型 (Reference Model)...")
-        self.model_ref = DiffusionWrapper(unet_config, conditioning_key)
-
-        if ref_ckpt_path is None:
-            print(f"DPO 警告: ref_ckpt_path 为 None。参考模型将使用随机权重。")
+        
+        # ⭐ 优化：SFT 模式下不需要参考模型，节省显存
+        if use_sft_loss:
+            print(f"✓ SFT 模式：跳过参考模型加载（节省显存）")
+            self.model_ref = None  # SFT 不需要参考模型
         else:
-            print(f"DPO: 正在从 {ref_ckpt_path} 加载参考模型权重...")
-            sd = torch.load(ref_ckpt_path, map_location="cpu")
-            if "state_dict" in sd:
-                sd = sd["state_dict"]
-            
-            model_ref_sd = {k.replace('model.diffusion_model.', ''): v 
-                            for k, v in sd.items() 
-                            if k.startswith('model.diffusion_model.')}
-                            
-            self.model_ref.diffusion_model.load_state_dict(model_ref_sd, strict=True)
-            print(f"DPO: 参考模型权重加载完毕。")
+            print(f"DPO: 正在实例化参考模型 (Reference Model)...")
+            self.model_ref = DiffusionWrapper(unet_config, conditioning_key)
 
+            if ref_ckpt_path is None:
+                print(f"DPO 警告: ref_ckpt_path 为 None。参考模型将使用随机权重。")
+            else:
+                print(f"DPO: 正在从 {ref_ckpt_path} 加载参考模型权重...")
+                sd = torch.load(ref_ckpt_path, map_location="cpu")
+                if "state_dict" in sd:
+                    sd = sd["state_dict"]
+                
+                model_ref_sd = {k.replace('model.diffusion_model.', ''): v 
+                                for k, v in sd.items() 
+                                if k.startswith('model.diffusion_model.')}
+                                
+                self.model_ref.diffusion_model.load_state_dict(model_ref_sd, strict=True)
+                print(f"DPO: 参考模型权重加载完毕。")
 
-        #-------------------DPO结束---------------------------------
+            #-------------------DPO结束---------------------------------
 
-        self.model_ref.eval()
-        self.model_ref.train = disabled_train
-        for param in self.model_ref.parameters():
-            param.requires_grad = False#参考模型不更新权重
+            self.model_ref.eval()
+            self.model_ref.train = disabled_train
+            for param in self.model_ref.parameters():
+                param.requires_grad = False  # 参考模型不更新权重
             
         # 保存 DPO 配置（已经从 kwargs 中提取）
+        self.use_sft_loss = use_sft_loss  # ⭐ 新增
         self.dpo_beta = dpo_beta
         self.use_auxiliary_losses = use_auxiliary_losses
         self.aux_diffusion_weight = aux_diffusion_weight
@@ -641,7 +676,9 @@ class LatentDiffusion(DDPM):
         self.aux_reconstruct_ddim_steps = aux_reconstruct_ddim_steps
         self.dpo_loss_weight = dpo_loss_weight
         
-        print(f"DPO 辅助损失配置:")
+        print(f"训练模式配置:")
+        print(f"  - 使用 SFT Loss: {self.use_sft_loss} {'(有监督微调)' if self.use_sft_loss else '(DPO偏好优化)'}")
+        print(f"  - DPO β参数: {self.dpo_beta}")
         print(f"  - DPO 损失权重: {self.dpo_loss_weight}")
         print(f"  - 是否启用辅助损失: {self.use_auxiliary_losses}")
         if self.use_auxiliary_losses:
@@ -1236,7 +1273,8 @@ class LatentDiffusion(DDPM):
     @torch.no_grad()
     def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
               cond_key=None, return_original_cond=False, bs=None, get_mask=False, 
-              get_reference=False, get_landmarks_out=False, get_gt=False, get_inpaint=False):
+              get_reference=False, get_landmarks_out=False, get_gt=False, get_inpaint=False,
+              get_ref_raw=False):  # 新增参数
     
         # 1. 获取所有输入 (大小 B)
         x_w = batch['GT_w'].to(self.device, memory_format=torch.contiguous_format).float()
@@ -1245,6 +1283,12 @@ class LatentDiffusion(DDPM):
         inpaint = batch['inpaint_image'].to(self.device, memory_format=torch.contiguous_format).float()
         mask = batch['inpaint_mask'].to(self.device, memory_format=torch.contiguous_format).float()
         reference = batch['ref_imgs'].to(self.device, memory_format=torch.contiguous_format).float()
+        
+        # 新增：获取未mask的参考图像（如果需要）
+        if 'ref_img_raw' in batch:
+            ref_raw = batch['ref_img_raw'].to(self.device, memory_format=torch.contiguous_format).float()
+        else:
+            ref_raw = None
         
         if bs is not None:
             x_w, x_l = x_w[:bs], x_l[:bs]
@@ -1269,7 +1313,9 @@ class LatentDiffusion(DDPM):
             landmarks = None
         
         if self.model.conditioning_key is not None:
-            xc = reference
+            # ⭐ 优先使用未mask的 ref_raw 作为条件（信息更完整）
+            # 如果 ref_raw 不存在，则回退到 reference (masked版本)
+            xc = ref_raw if ref_raw is not None else reference
             if not self.cond_stage_trainable or force_c_encode:
                 c_shared = self.conditioning_with_feat(xc, landmarks=landmarks).float()
             else:
@@ -1297,6 +1343,8 @@ class LatentDiffusion(DDPM):
             out.append(GT_original)
         if get_inpaint:
             out.append(inpaint)
+        if get_ref_raw:
+            out.append(ref_raw)  # 新增：返回未mask的参考图像
         
         return out
   
@@ -1472,24 +1520,27 @@ class LatentDiffusion(DDPM):
         return loss
     def shared_step_face(self, batch, **kwargs):
         # ⭐ 解包：z_w, z_l, c 都是 [B, ...]
-       # 修改后：添加 force_c_encode=True
+       # 修改后：添加 force_c_encode=True 和 get_ref_raw=True
         outputs = self.get_input(batch, self.first_stage_key, 
-                        force_c_encode=True,  # ← 添加这一行，强制编码条件
+                        force_c_encode=True,  # ← 强制编码条件
                         get_landmarks_out=True, 
                         get_reference=True, 
-                        get_gt=True)
+                        get_gt=True,
+                        get_ref_raw=True)  # ← 新增：获取未mask的参考图像
         
         z_w = outputs[0]          # [B, 9, 64, 64] - 赢家潜变量
         z_l = outputs[1]          # [B, 9, 64, 64] - 输家潜变量
         c = outputs[2]            # [B, 1, 768] - 条件
-        reference = outputs[3]    # [B, 3, 224, 224] - 参考图像
+        reference = outputs[3]    # [B, 3, 224, 224] - 参考图像（已mask）
         landmarks = outputs[4]    # landmarks（如果需要）
         GT_w = outputs[5]         # [B, 3, H, W] - 赢家的 GT 图像
+        ref_raw = outputs[6]      # [B, 3, 224, 224] - 参考图像（未mask）⭐ 新增
         
         # 调用 forward_face，传递所有需要的参数
         loss = self.forward_face(z_w, z_l, c, 
                                landmarks=landmarks,
-                               reference=reference, 
+                               reference=reference,
+                               ref_raw=ref_raw,  # ← 新增
                                GT_w=GT_w)
         return loss
 
@@ -1517,14 +1568,15 @@ class LatentDiffusion(DDPM):
         else:  #x:[4,9,64,64] c:[4,1,768] x: img,inpaint_img,mask after first stage c:clip embedding
             return self.p_losses(x, c, t, *args, **kwargs)
     
-    def forward_face(self, z_w, z_l, c, landmarks=None, reference=None, GT_w=None, 
+    def forward_face(self, z_w, z_l, c, landmarks=None, reference=None, ref_raw=None, GT_w=None, 
                     *args, **kwargs):
         """
         ⭐ 直接接收三个 B 批次的张量
         z_w: [B, 9, 64, 64] - 赢家潜变量
         z_l: [B, 9, 64, 64] - 输家潜变量
         c: [B, 1, 768]      - 共享条件
-        reference: [B, 3, 224, 224] - 参考图像（用于 ID 损失）
+        reference: [B, 3, 224, 224] - 参考图像（已mask，用于条件）
+        ref_raw: [B, 3, 224, 224] - 参考图像（未mask，用于 ID 损失）⭐ 新增
         GT_w: [B, 3, H, W] - 赢家的 GT 图像（用于感知损失）
         """
         # 1. 获取批次大小
@@ -1534,12 +1586,20 @@ class LatentDiffusion(DDPM):
         t = torch.randint(0, self.num_timesteps, (B,), device=self.device).long()
         
         # 3. ⭐ 传递额外参数到 p_losses_dpo
-        return self.p_losses_dpo(z_w, z_l, c, t, 
-                                reference=reference, 
+        if self.use_sft_loss:
+            return self.p_loss_sft(z_w, z_l, c, t, 
+                                reference=reference,
+                                ref_raw=ref_raw,  # ← 新增
+                                GT_w=GT_w, 
+                                landmarks=landmarks,
+                                *args, **kwargs)    
+        else:
+            return self.p_losses_dpo(z_w, z_l, c, t, 
+                                reference=reference,
+                                ref_raw=ref_raw,  # ← 新增
                                 GT_w=GT_w, 
                                 landmarks=landmarks,
                                 *args, **kwargs)
-                
                 
 
     def _rescale_annotations(self, bboxes, crop_coordinates):  # TODO: move to dataset
@@ -1710,22 +1770,136 @@ class LatentDiffusion(DDPM):
         loss += (self.original_elbo_weight * loss_vlb)
         loss_dict.update({f'{prefix}/loss': loss})
         
-        # 只在主进程记录到 wandb (自动提交)
+        # ⭐ 修复阻塞问题：commit=False，避免每个batch都等待上传
         if wandb.run is not None:
-            wandb.log(loss_dict, commit=True)
+            wandb.log(loss_dict, commit=False)
         return loss, loss_dict
-    def p_losses_dpo(self, z_start_w, z_start_l, cond, t, reference=None, GT_w=None, landmarks=None):
+    def p_loss_sft(self, z_start_w, z_start_l, cond, t, reference=None, ref_raw=None, GT_w=None, landmarks=None):
+        """
+        SFT损失函数 - 参考论文公式
+        L = λ_id * L_id + λ_DM * L_DM + λ_rec * L_rec
+        
+        参数说明（换脸任务）:
+        z_start_w: GT潜变量 (B, 9, 64, 64) - [z0_A, z_inp, m]
+                   - z0_A (0:4): A图像的latent（换脸后的正确结果 - 真正的GT）
+                   - z_inp (4:8): D图像的latent（提供姿态）
+                   - m (8:9): mask
+        z_start_l: 不使用（为了兼容接口保留，SFT不需要loser）
+        cond: 条件 (B, 1, 768) - 从B图像提取（提供身份）
+        t: 时间步 (B,) - 论文中使用t=999进行one-step训练
+        reference: B图像在像素空间（已mask，用于条件）
+        ref_raw: B图像在像素空间（未mask，用于ID损失）⭐ 新增
+        GT_w: A图像在像素空间（真正的GT，用于重构损失）
+        
+        换脸任务概念：
+        - A = 真正的GT（换脸后的正确结果）
+        - B = Source（提供身份）
+        - D = Target（提供姿态）
+        - 目标：学习 (D + B的条件) → A 的映射
+        """
+        loss_dict = {}
+        prefix = 'train' if self.training else 'val'
+        
+        # ========== 1️⃣ Diffusion Loss (L_DM) - 主要损失 ==========
+        # 论文: L_DM = E[||ε - ε_θ(z_t, c, t)||_2]
+        
+        # 采样噪声
+        noise = torch.randn_like(z_start_w[:, :4, :, :])
+        
+        # 对GT（A）加噪
+        z0_A = z_start_w[:, :4, :, :]  # A图像的latent
+        z_t = self.q_sample(x_start=z0_A, t=t, noise=noise)
+        
+        # 拼接输入（D）和mask
+        z_noisy = torch.cat([z_t, z_start_w[:, 4:, :, :]], dim=1)  # (B, 9, 64, 64)
+        
+        # 模型预测噪声
+        pred_noise = self.apply_model(z_noisy, t, cond)
+        
+        # 计算Diffusion损失
+        loss_DM = self.get_loss(pred_noise, noise, mean=True)
+        loss_dict[f'{prefix}/loss_DM'] = loss_DM
+        
+        # 主损失（根据配置的权重）
+        loss_total = self.aux_diffusion_weight * loss_DM
+        
+        # ========== 2️⃣ ID Loss (L_id) + Reconstruction Loss (L_rec) ==========
+        # 论文: 使用one-step property进行推理，避免多步DDIM采样
+        
+        if (self.aux_id_loss_weight > 0 or self.aux_lpips_loss_weight > 0):
+            # 使用单步预测x0（基于DDPM公式）
+            # x0 = (z_t - sqrt(1-α_t) * ε) / sqrt(α_t)
+            pred_x0 = self.predict_start_from_noise(z_t, t, pred_noise)
+            
+            # 解码到像素空间（只解码一次，高效！）
+            x_pred = self.differentiable_decode_first_stage(pred_x0)
+            
+            # 2.1 ID Loss - L_id = 1 - cos(e_ID_A1, e_ID_Ã)
+            if self.aux_id_loss_weight > 0 and hasattr(self, 'face_ID_model'):
+                # ⭐ 优先使用未mask的参考图像 ref_raw
+                source_for_id = ref_raw if ref_raw is not None else reference
+                
+                if source_for_id is not None:
+                    # 准备Source图像B（从CLIP归一化转为标准归一化）
+                    source_normalized = un_norm_clip(source_for_id)
+                    source_normalized = TF.normalize(source_normalized,
+                                                    mean=[0.5, 0.5, 0.5],
+                                                    std=[0.5, 0.5, 0.5])
+                else:
+                    source_normalized = None
+            
+            if self.aux_id_loss_weight > 0 and source_normalized is not None and hasattr(self, 'face_ID_model'):
+                
+                # 准备mask（只在人脸区域计算）
+                mask = 1 - TF.resize(z_start_w[:, 8, :, :],
+                                    (x_pred.shape[2], x_pred.shape[3]))
+                
+                # 应用mask
+                x_pred_masked = x_pred * mask.unsqueeze(1)
+                
+                # 计算ID损失（余弦相似度损失）
+                # 论文: L_id = 1 - cos(e_ID_A1, e_ID_Ã)
+                loss_id, sim_imp, _ = self.face_ID_model(
+                    x_pred_masked, source_normalized, clip_img=False
+                )
+                
+                loss_total += self.aux_id_loss_weight * loss_id
+                loss_dict[f'{prefix}/loss_id'] = loss_id
+                loss_dict[f'{prefix}/sim_imp'] = sim_imp
+            
+            # 2.2 Reconstruction Loss - L_rec = ||ID_A2 - ID_Ã||_2^2
+            # 这里L2损失（感知上更好）
+            if self.aux_lpips_loss_weight > 0 and GT_w is not None and hasattr(self, 'lpips_loss'):
+                #计算L2损失
+                loss_rec = self.get_loss(x_pred, GT_w, mean=True)
+                loss_total += self.aux_lpips_loss_weight * loss_rec
+                loss_dict[f'{prefix}/loss_rec'] = loss_rec
+                
+        
+        # ========== 总损失 ==========
+        # 论文: L = λ_id * L_id + λ_DM * L_DM + λ_rec * L_rec
+        loss_dict[f'{prefix}/loss'] = loss_total
+        
+        # ⭐ 修复阻塞问题：commit=False，避免每个batch都等待上传
+        if wandb.run is not None:
+            wandb.log(loss_dict, commit=False)
+        
+        return loss_total, loss_dict
+
+
+    def p_losses_dpo(self, z_start_w, z_start_l, cond, t, reference=None, ref_raw=None, GT_w=None, landmarks=None):
         """
         计算 Diffusion DPO 损失 + 可选的辅助损失
 
         参数:
-        z_start_w: "赢家" 潜变量 (B, 9, 64, 64) - [z0_w, z_inp, m]
-        z_start_l: "输家" 潜变量 (B, 9, 64, 64) - [z0_l, z_inp, m]
+        z_start_w: "赢家" 潜变量 (B, 9, 64, 64) - [z0_w, z_inp, m]，A
+        z_start_l: "输家" 潜变量 (B, 9, 64, 64) - [z0_l, z_inp, m],E
         cond: 共享条件 (B, 1, 768) - (来自 ref_imgs)
         t: 共享时间步 (B,)
-        reference: 参考图像（用于 ID 损失）
-        GT_w: 赢家的 GT 图像（用于感知损失）
-        landmarks: 地标（如果需要）
+        reference: 参考图像（已mask，用于条件）
+        ref_raw: 参考图像（未mask，用于 ID 损失）⭐ 新增
+        GT_w:实际是B,伪造target
+        landmarks: B的landmarks
         """
         # (D1) 修正：分别采样独立噪声 epsilon_w 和 epsilon_l
         noise_w = torch.randn_like(z_start_w[:, :4, :, :])
@@ -1736,6 +1910,7 @@ class LatentDiffusion(DDPM):
         z_noisy_w = torch.cat((z_t_w, z_start_w[:, 4:, :, :]), dim=1) 
 
         # 输家：对 z0_l 加噪
+        #如果dpo权重不等于0
         z_t_l = self.q_sample(x_start=z_start_l[:, :4, :, :], t=t, noise=noise_l)
         z_noisy_l = torch.cat((z_t_l, z_start_l[:, 4:, :, :]), dim=1) 
         
@@ -1748,12 +1923,16 @@ class LatentDiffusion(DDPM):
         pred_noise_policy_w = self.apply_model(z_noisy_w, t, cond)
         pred_noise_policy_l = self.apply_model(z_noisy_l, t, cond)
 
+        # ⭐ 安全检查：确保参考模型存在（DPO模式才需要）
+        if self.model_ref is None:
+            raise RuntimeError("参考模型未初始化！p_losses_dpo 需要参考模型，请检查配置。")
+        
         with torch.no_grad():
             pred_noise_ref_w = self.model_ref(z_noisy_w, t, **c_dict)
             pred_noise_ref_l = self.model_ref(z_noisy_l, t, **c_dict)
 
         
-    # (D3) 修正：计算 Loss 时，target 必须对应各自的 noise
+        # (D3) 修正：计算 Loss 时，target 必须对应各自的 noise
         # 赢家比较 pred_w 和 noise_w
         loss_policy_w = self.get_loss(pred_noise_policy_w, noise_w, mean=False).mean(dim=[1, 2, 3])
         loss_ref_w    = self.get_loss(pred_noise_ref_w,    noise_w, mean=False).mean(dim=[1, 2, 3])
@@ -1780,7 +1959,7 @@ class LatentDiffusion(DDPM):
         if self.use_auxiliary_losses:
             # 1️⃣ 扩散重构损失（对赢样本）
             if self.aux_diffusion_weight > 0:
-                loss_diffusion = self.get_loss(pred_noise_policy_w, noise, mean=True)
+                loss_diffusion = self.get_loss(pred_noise_policy_w, noise_w, mean=True)
                 loss_aux_total += self.aux_diffusion_weight * loss_diffusion
                 loss_dict.update({f'{prefix}/loss_aux_diffusion': loss_diffusion})
             
@@ -1790,7 +1969,7 @@ class LatentDiffusion(DDPM):
                 # Step 1: 对赢样本加最大噪声
                 t_new = torch.randint(self.num_timesteps-1, self.num_timesteps, 
                                      (z_start_w.shape[0],), device=self.device).long()
-                z_noisy_rec = self.q_sample(x_start=z_start_w[:, :4, :, :], t=t_new, noise=noise)
+                z_noisy_rec = self.q_sample(x_start=z_start_w[:, :4, :, :], t=t_new, noise=noise_w)
                 z_noisy_rec = torch.cat((z_noisy_rec, z_start_w[:, 4:, :, :]), dim=1)
                 
                 # Step 2: DDIM 多步去噪重构
@@ -1822,12 +2001,20 @@ class LatentDiffusion(DDPM):
                     decoded_pred_x_0.append(decoded)
                 
                 # Step 4: 计算 ID 损失
-                if self.aux_id_loss_weight > 0 and reference is not None and hasattr(self, 'face_ID_model'):
-                    # 准备参考图像
-                    reference_normalized = un_norm_clip(reference)
-                    reference_normalized = TF.normalize(reference_normalized, 
-                                                       mean=[0.5, 0.5, 0.5], 
-                                                       std=[0.5, 0.5, 0.5])
+                if self.aux_id_loss_weight > 0 and hasattr(self, 'face_ID_model'):
+                    # ⭐ 优先使用未mask的参考图像 ref_raw
+                    source_for_id = ref_raw if ref_raw is not None else reference
+                    
+                    if source_for_id is not None:
+                        # 准备参考图像（从CLIP归一化转为标准归一化）
+                        reference_normalized = un_norm_clip(source_for_id)
+                        reference_normalized = TF.normalize(reference_normalized, 
+                                                           mean=[0.5, 0.5, 0.5], 
+                                                           std=[0.5, 0.5, 0.5])
+                    else:
+                        reference_normalized = None
+                
+                if self.aux_id_loss_weight > 0 and reference_normalized is not None and hasattr(self, 'face_ID_model'):
                     
                     # 准备 mask
                     masks = 1 - TF.resize(z_start_w[:, 8, :, :], 
@@ -1877,9 +2064,9 @@ class LatentDiffusion(DDPM):
         loss = self.dpo_loss_weight * loss_dpo + loss_aux_total
         loss_dict.update({f'{prefix}/loss': loss})
         
-        # 只在主进程记录到 wandb (自动提交)
+        # ⭐ 修复阻塞问题：commit=False，避免每个batch都等待上传
         if wandb.run is not None:
-            wandb.log(loss_dict, commit=True)
+            wandb.log(loss_dict, commit=False)
         return loss, loss_dict
 
 
@@ -2097,11 +2284,536 @@ class LatentDiffusion(DDPM):
                                                  return_intermediates=True,**kwargs)
 
         return samples, intermediates
+    
+    @rank_zero_only
+    @torch.no_grad()
+    def run_test_during_training(self):
+        """训练过程中进行测试：生成样本并计算指标"""
+        if not hasattr(self, 'test_during_training') or not self.test_during_training:
+            return
+        
+        print(f"\n{'='*60}")
+        print(f"[Test During Training] Step {self.global_step}: Starting test evaluation")
+        print(f"{'='*60}\n")
+        
+        try:
+            # 1. 从配置中获取测试数据集配置（参考inference_test_bench.py）
+            if not hasattr(self.trainer, 'datamodule'):
+                print("[Test] No datamodule available, skipping test")
+                return
+            
+            # 从datamodule获取配置
+            test_dataloader = None
+            try:
+                # 尝试从datamodule的dataset_configs获取测试配置
+                if hasattr(self.trainer.datamodule, 'dataset_configs') and 'test' in self.trainer.datamodule.dataset_configs:
+                    test_config = self.trainer.datamodule.dataset_configs['test']
+                    test_args = test_config.get('params', {})
+                    
+                    # 优先使用self.test_dataset_name参数（参考inference_test_bench.py的opt.dataset逻辑）
+                    # 如果未设置，则从配置文件的target中提取
+                    dataset_name = getattr(self, 'test_dataset_name', None)
+                    if dataset_name is None or dataset_name == "" or dataset_name == "1":
+                        # 从配置文件target中提取数据集名称
+                        config_target = test_config.get('target', '').split('.')[-1]  # 例如: CelebAdataset
+                        if 'CelebAdataset' in config_target:
+                            dataset_name = 'CelebA'
+                        elif 'FFHQdataset' in config_target:
+                            dataset_name = 'FFHQ'
+                        elif 'FFdataset' in config_target or 'FF++' in config_target:
+                            dataset_name = 'FF++'
+                        else:
+                            dataset_name = 'CelebA'  # 默认使用CelebA
+                    
+                    # 创建测试数据集（参考inference_test_bench.py第394-402行）
+                    from ldm.data.test_bench_dataset import CelebAdataset, FFHQdataset, FFdataset
+                    
+                    if dataset_name == 'CelebA':
+                        test_dataset = CelebAdataset(split='test', **test_args)
+                    elif dataset_name == 'FFHQ':
+                        test_dataset = FFHQdataset(split='test', **test_args)
+                    elif dataset_name == 'FF++':
+                        test_dataset = FFdataset(split='test', **test_args)
+                    else:
+                        print(f"[Test] Unknown test dataset name: {dataset_name}, using FFHQ as default")
+                        test_dataset = FFHQdataset(split='test', **test_args)
+                    
+                    if test_dataset is not None:
+                        # 创建测试dataloader
+                        import torch.utils.data
+                        test_dataloader = torch.utils.data.DataLoader(
+                            test_dataset,
+                            batch_size=self.test_batch_size,
+                            num_workers=4,
+                            pin_memory=True,
+                            shuffle=False,
+                            drop_last=False
+                        )
+                        print(f"[Test] Created test dataset: {dataset_name} with {len(test_dataset)} samples")
+                
+            except Exception as e:
+                print(f"[Test] Failed to create test dataset: {e}")
+            
+            # 如果没有成功创建test_dataloader，使用validation数据集
+            if test_dataloader is None:
+                print("[Test] Using validation dataset instead")
+                try:
+                    test_dataloader = self.trainer.datamodule.val_dataloader()
+                    print(f"[Test] Using validation dataloader")
+                except Exception as e:
+                    print(f"[Test] Failed to get validation dataloader: {e}, skipping test")
+                    return
+            
+            # 3. 创建临时输出目录（在--logdir/tmp下）
+            # 获取logdir（优先使用trainer.logdir，这是--logdir参数指定的目录）
+            if hasattr(self.trainer, 'logdir'):
+                logdir = self.trainer.logdir
+            elif hasattr(self.trainer, 'logger') and hasattr(self.trainer.logger, 'log_dir'):
+                # 如果没有logdir，回退到logger.log_dir
+                logdir = self.trainer.logger.log_dir
+            else:
+                logdir = "logs"
+            
+            # 创建tmp目录
+            tmp_dir = os.path.join(logdir, "tmp")
+            os.makedirs(tmp_dir, exist_ok=True)
+            
+            # 测试样本保存在 tmp/test_samples_step_{step}/
+            test_output_dir = os.path.join(tmp_dir, f"test_samples_step_{self.global_step}")
+            os.makedirs(test_output_dir, exist_ok=True)
+            
+            # 4. 生成样本
+            num_samples = getattr(self, 'test_num_samples', 200)
+            print(f"[Test] Generating {num_samples} samples...")
+            
+            samples_generated = 0
+            
+            with self.ema_scope("Testing"):
+                for batch_idx, batch_data in enumerate(test_dataloader):
+                    if samples_generated >= num_samples:
+                        break
+                    
+                    # 测试数据集的格式: (test_batch, prior, test_model_kwargs, segment_id_batch)
+                    # 参考inference_test_bench.py第441行
+                    if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 3:
+                        test_batch = batch_data[0].to(self.device)  # [B, 3, H, W] - 目标图像
+                        prior = batch_data[1].to(self.device) if len(batch_data) > 1 and isinstance(batch_data[1], torch.Tensor) else test_batch
+                        test_model_kwargs = batch_data[2] if isinstance(batch_data[2], dict) else {}
+                        segment_id_batch = batch_data[3] if len(batch_data) > 3 else [f"{samples_generated + i:06d}" for i in range(test_batch.shape[0])]
+                        
+                        # 从test_model_kwargs中提取数据
+                        inpaint_image = test_model_kwargs.get('inpaint_image', test_batch)
+                        if isinstance(inpaint_image, torch.Tensor):
+                            inpaint_image = inpaint_image.to(self.device)
+                        else:
+                            inpaint_image = test_batch
+                            
+                        inpaint_mask = test_model_kwargs.get('inpaint_mask', torch.ones_like(test_batch[:, :1]))
+                        if isinstance(inpaint_mask, torch.Tensor):
+                            inpaint_mask = inpaint_mask.to(self.device)
+                        else:
+                            inpaint_mask = torch.ones_like(test_batch[:, :1])
+                            
+                        ref_imgs = test_model_kwargs.get('ref_imgs', test_batch)
+                        if isinstance(ref_imgs, torch.Tensor):
+                            ref_imgs = ref_imgs.to(self.device)
+                            # ref_imgs可能是[B, 1, 224, 224]，需要squeeze
+                            if ref_imgs.dim() == 4 and ref_imgs.shape[1] == 1:
+                                ref_imgs = ref_imgs.squeeze(1)  # [B, 224, 224]
+                                # 如果是单通道，需要转换为RGB
+                                if ref_imgs.dim() == 3:
+                                    ref_imgs = ref_imgs.unsqueeze(1).repeat(1, 3, 1, 1)  # [B, 3, 224, 224]
+                        else:
+                            ref_imgs = test_batch
+                        
+                        # 转换为训练格式的batch
+                        batch = {
+                            'GT': test_batch,  # 目标图像
+                            'inpaint_image': inpaint_image,
+                            'inpaint_mask': inpaint_mask,
+                            'ref_imgs': ref_imgs,
+                            # 测试数据集没有GT_w和GT_l，使用GT代替（这些在测试时不会被使用）
+                            'GT_w': test_batch,
+                            'GT_l': test_batch,
+                        }
+                    elif isinstance(batch_data, dict):
+                        # 已经是训练格式
+                        batch = batch_data
+                        for key in batch:
+                            if isinstance(batch[key], torch.Tensor):
+                                batch[key] = batch[key].to(self.device)
+                    else:
+                        print(f"[Test] Unknown batch format, skipping")
+                        continue
+                    
+                    batch_size = batch['GT'].shape[0]
+                    remaining = num_samples - samples_generated
+                    if remaining < batch_size:
+                        # 只处理需要的数量
+                        for key in batch:
+                            if isinstance(batch[key], torch.Tensor):
+                                batch[key] = batch[key][:remaining]
+                        batch_size = remaining
+                    
+                    # 获取输入（参考inference_test_bench.py的处理方式）
+                    test_batch = batch['GT'].to(self.device)
+                    test_model_kwargs = {
+                        'inpaint_image': batch['inpaint_image'].to(self.device),
+                        'inpaint_mask': batch['inpaint_mask'].to(self.device),
+                        'ref_imgs': batch['ref_imgs'].to(self.device)
+                    }
+                    
+                    # 处理 unconditional_conditioning (uc)（参考inference_test_bench.py第498-512行）
+                    # 获取测试时的scale参数（默认不使用guidance，scale=1.0）
+                    test_scale = getattr(self, 'test_guidance_scale', 1.0)
+                    uc = None
+                    if test_scale != 1.0:
+                        uc = self.learnable_vector.repeat(test_batch.shape[0], 1, 1)
+                        if hasattr(self, 'stack_feat') and self.stack_feat:
+                            uc2 = self.other_learnable_vector.repeat(test_batch.shape[0], 1, 1)
+                            uc = torch.cat([uc, uc2], dim=-1)
+                    
+                    # 获取条件（参考inference_test_bench.py第506-518行）
+                    landmarks = self.get_landmarks(test_batch) if (self.Landmark_cond or self.Landmark_loss_weight > 0) else None
+                    
+                    # 处理ref_imgs的维度
+                    ref_imgs_for_cond = test_model_kwargs['ref_imgs']
+                    if ref_imgs_for_cond.dim() == 5:  # [B, 1, 3, H, W]
+                        ref_imgs_for_cond = ref_imgs_for_cond.squeeze(1)  # [B, 3, H, W]
+                    elif ref_imgs_for_cond.dim() == 4 and ref_imgs_for_cond.shape[1] == 1:  # [B, 1, H, W]
+                        ref_imgs_for_cond = ref_imgs_for_cond.squeeze(1)  # [B, H, W]
+                        if ref_imgs_for_cond.dim() == 3:
+                            ref_imgs_for_cond = ref_imgs_for_cond.unsqueeze(1).repeat(1, 3, 1, 1)  # [B, 3, H, W]
+                    
+                    c = self.conditioning_with_feat(
+                        ref_imgs_for_cond.to(torch.float32),
+                        landmarks=landmarks,
+                        tar=test_batch.to(torch.float32)
+                    ).float()
+                    
+                    if c.shape[-1] == 1024 and hasattr(self, 'proj_out'):
+                        c = self.proj_out(c)
+                    if len(c.shape) == 2:
+                        c = c.unsqueeze(1)
+                    
+                    # 处理landmarks和uc（如果需要，参考inference_test_bench.py第508-512行）
+                    if (hasattr(self, 'land_mark_id_seperate_layers') and self.land_mark_id_seperate_layers) or \
+                       (hasattr(self, 'sep_head_att') and self.sep_head_att):
+                        if test_scale != 1.0 and landmarks is not None:
+                            landmarks_expanded = landmarks.unsqueeze(1) if len(landmarks.shape) != 3 else landmarks
+                            uc = torch.cat([uc, landmarks_expanded], dim=-1)
+                    
+                    # 编码inpaint_image和mask（参考inference_test_bench.py第519-524行）
+                    inpaint_image = test_model_kwargs['inpaint_image']
+                    inpaint_mask = test_model_kwargs['inpaint_mask']
+                    z_inpaint = self.encode_first_stage(inpaint_image)
+                    z_inpaint = self.get_first_stage_encoding(z_inpaint).detach()
+                    test_model_kwargs['inpaint_image'] = z_inpaint
+                    test_model_kwargs['inpaint_mask'] = Resize([z_inpaint.shape[-1], z_inpaint.shape[-1]])(inpaint_mask)
+                    
+                    # 生成样本（参考inference_test_bench.py第528-538行）
+                    from ldm.models.diffusion.ddim import DDIMSampler
+                    sampler = DDIMSampler(self)
+                    
+                    shape = [self.channels, self.image_size, self.image_size]
+                    start_code = None  # 不使用固定起始噪声
+                    
+                    samples_ddim, intermediates = sampler.sample(
+                        S=self.test_ddim_steps,  # ddim_steps（参考inference_test_bench.sh，默认50）
+                        conditioning=c,
+                        batch_size=batch_size,
+                        shape=shape,
+                        verbose=False,
+                        unconditional_guidance_scale=test_scale,  # 使用测试时的scale参数（参考inference_test_bench.sh，默认3.0）
+                        unconditional_conditioning=uc,
+                        eta=0.0,  # ddim_eta
+                        x_T=start_code,
+                        log_every_t=100,
+                        test_model_kwargs=test_model_kwargs,
+                        src_im=ref_imgs_for_cond.to(torch.float32),
+                        tar=test_batch.to(torch.float32)
+                    )
+                    
+                    samples = samples_ddim
+                    
+                    # 解码并保存（参考inference_test_bench.py）
+                    x_samples = self.decode_first_stage(samples)
+                    x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
+                    
+                    for i in range(batch_size):
+                        img = x_samples[i].cpu().permute(1, 2, 0).numpy()
+                        img = (img * 255).astype(np.uint8)
+                        # 使用segment_id_batch作为文件名（参考inference_test_bench.py）
+                        if 'segment_id_batch' in locals() and isinstance(segment_id_batch, (list, tuple)) and i < len(segment_id_batch):
+                            filename = f"{segment_id_batch[i]}.png"
+                        else:
+                            filename = f"{samples_generated + i:06d}.png"
+                        Image.fromarray(img).save(
+                            os.path.join(test_output_dir, filename)
+                        )
+                    
+                    samples_generated += batch_size
+                    if samples_generated >= num_samples:
+                        break
+            
+            print(f"[Test] Generated {samples_generated} samples, saved to {test_output_dir}")
+            
+            # 5. 调用评估脚本计算指标
+            self.calculate_test_metrics(test_output_dir, tmp_dir)
+            
+        except Exception as e:
+            print(f"[Test] Error during testing: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    @rank_zero_only
+    def calculate_test_metrics(self, test_output_dir, tmp_dir):
+        """调用评估脚本计算指标"""
+        import subprocess
+        import re
+        
+        # 获取测试路径配置
+        dataset_name = getattr(self, 'test_dataset_name', 'celeba')
+        # 将数据集名称映射为ID_retrieval.py期望的格式（参考ID_retrieval.py第178-185行）
+        # ID_retrieval.py支持: "celeba", "ffhq", "ff++"
+        dataset_name_lower = dataset_name.lower() if dataset_name else 'celeba'
+        if dataset_name_lower == 'ffhq':
+            id_retrieval_dataset = 'ffhq'
+        elif dataset_name_lower == 'ff++':
+            id_retrieval_dataset = 'ff++'
+        else:
+            id_retrieval_dataset = 'celeba'  # 默认使用celeba
+        
+        source_path = getattr(self, 'test_source_path', None)
+        target_path = getattr(self, 'test_target_path', None)
+        source_mask_path = getattr(self, 'test_source_mask_path', None)
+        target_mask_path = getattr(self, 'test_target_mask_path', None)
+        
+        if not target_path:
+            print("[Test] test_target_path not configured, skipping metrics calculation")
+            return
+        
+        # 设置日志文件（保存在tmp目录下）
+        metrics_log_file = os.path.join(tmp_dir, f"test_metrics_step_{self.global_step}.txt")
+        
+        print(f"\n[Test] Calculating metrics, results will be saved to {metrics_log_file}")
+        
+        # 获取项目根目录
+        import pathlib
+        project_root = pathlib.Path(__file__).parent.parent.parent.parent
+        project_root_str = str(project_root)
+        
+        # 获取当前CUDA设备
+        if torch.cuda.is_available():
+            cuda_device = str(self.device.index if hasattr(self.device, 'index') and self.device.index is not None else 0)
+        else:
+            cuda_device = None
+        
+        metrics_results = {}
+        
+        # 构建基础命令前缀（参考ID_retrieval.py的命令格式）
+        def build_cmd_prefix(script_path):
+            """构建包含CUDA_VISIBLE_DEVICES和PYTHONPATH的命令前缀"""
+            cmd_parts = []
+            if cuda_device is not None:
+                cmd_parts.append(f"CUDA_VISIBLE_DEVICES={cuda_device}")
+            cmd_parts.append(f'PYTHONPATH="{project_root_str}:$PYTHONPATH"')
+            cmd_parts.append(f"python {script_path}")
+            return " \\\n    ".join(cmd_parts)
+        
+        # 1. 计算 Pose 距离
+        if target_path:
+            print("[Test] Calculating Pose distance...")
+            try:
+                pose_output_file = os.path.join(tmp_dir, f'test_pose_step_{self.global_step}.txt')
+                script_path = str(project_root / 'eval_tool' / 'Pose' / 'pose_compare.py')
+                cmd_prefix = build_cmd_prefix(script_path)
+                cmd_args = f"{target_path} {test_output_dir} --max-samples {getattr(self, 'test_num_samples', 200)} --output {pose_output_file} --device {'cuda' if torch.cuda.is_available() else 'cpu'}"
+                cmd = f"{cmd_prefix} \\\n    {cmd_args}"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=project_root_str)
+                if result.returncode == 0:
+                    # 从输出文件读取结果
+                    if os.path.exists(pose_output_file):
+                        with open(pose_output_file, 'r') as f:
+                            content = f.read()
+                            match = re.search(r'Pose_value:\s*([\d.]+)', content)
+                            if match:
+                                pose_value = float(match.group(1))
+                                metrics_results['pose_distance'] = pose_value
+                                self.log('test/pose_distance', pose_value, on_step=True, prog_bar=True)
+                                print(f"[Test] Pose Distance: {pose_value:.4f}")
+                else:
+                    print(f"[Test] Pose calculation failed with return code {result.returncode}")
+                    print(f"[Test] Error: {result.stderr}")
+            except Exception as e:
+                print(f"[Test] Pose calculation failed: {e}")
+        
+        # 2. 计算 Expression 距离
+        if target_path:
+            print("[Test] Calculating Expression distance...")
+            try:
+                expr_output_file = os.path.join(tmp_dir, f'test_expression_step_{self.global_step}.txt')
+                script_path = str(project_root / 'eval_tool' / 'Expression' / 'expression_compare_face_recon.py')
+                cmd_prefix = build_cmd_prefix(script_path)
+                cmd_args = f"{target_path} {test_output_dir} --max-samples {getattr(self, 'test_num_samples', 200)} --output {expr_output_file} --device {'cuda' if torch.cuda.is_available() else 'cpu'}"
+                cmd = f"{cmd_prefix} \\\n    {cmd_args}"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=project_root_str)
+                if result.returncode == 0:
+                    # 从输出文件读取结果
+                    if os.path.exists(expr_output_file):
+                        with open(expr_output_file, 'r') as f:
+                            content = f.read()
+                            match = re.search(r'Expression_value:\s*([\d.]+)', content)
+                            if match:
+                                expr_value = float(match.group(1))
+                                metrics_results['expression_distance'] = expr_value
+                                self.log('test/expression_distance', expr_value, on_step=True, prog_bar=True)
+                                print(f"[Test] Expression Distance: {expr_value:.4f}")
+                else:
+                    print(f"[Test] Expression calculation failed with return code {result.returncode}")
+                    print(f"[Test] Error: {result.stderr}")
+            except Exception as e:
+                print(f"[Test] Expression calculation failed: {e}")
+        
+        # 3. 计算 ID Retrieval（如果有mask路径）
+        if source_path and source_mask_path and target_mask_path:
+            print("[Test] Calculating ID Retrieval...")
+            try:
+                id_output_file = os.path.join(tmp_dir, f'test_id_step_{self.global_step}.txt')
+                script_path = str(project_root / 'eval_tool' / 'ID_retrieval' / 'ID_retrieval.py')
+                cmd_prefix = build_cmd_prefix(script_path)
+                cmd_args = f"{source_path} {test_output_dir} {source_mask_path} {target_mask_path} --max-samples {getattr(self, 'test_num_samples', 200)} --output {id_output_file} --arcface True --dataset {id_retrieval_dataset}"
+                cmd = f"{cmd_prefix} \\\n    {cmd_args}"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=project_root_str)
+                if result.returncode == 0:
+                    # 从输出文件读取结果
+                    if os.path.exists(id_output_file):
+                        with open(id_output_file, 'r') as f:
+                            content = f.read()
+                            top1_match = re.search(r'Top-1 accuracy:\s*([\d.]+)%', content)
+                            top5_match = re.search(r'Top-5 accuracy:\s*([\d.]+)%', content)
+                            mean_match = re.search(r'Mean ID feat:\s*([\d.]+)', content)
+                            if top1_match:
+                                top1 = float(top1_match.group(1)) / 100.0
+                                metrics_results['id_top1'] = top1
+                                self.log('test/id_top1', top1, on_step=True, prog_bar=True)
+                                print(f"[Test] ID Top-1: {top1*100:.2f}%")
+                            if top5_match:
+                                top5 = float(top5_match.group(1)) / 100.0
+                                metrics_results['id_top5'] = top5
+                                self.log('test/id_top5', top5, on_step=True, prog_bar=True)
+                                print(f"[Test] ID Top-5: {top5*100:.2f}%")
+                            if mean_match:
+                                mean_id = float(mean_match.group(1))
+                                metrics_results['id_mean'] = mean_id
+                                self.log('test/id_mean', mean_id, on_step=True, prog_bar=True)
+                                print(f"[Test] ID Mean: {mean_id:.4f}")
+                else:
+                    print(f"[Test] ID Retrieval calculation failed with return code {result.returncode}")
+                    print(f"[Test] Error: {result.stderr}")
+            except Exception as e:
+                print(f"[Test] ID Retrieval calculation failed: {e}")
+        
+        # 4. 计算 FID（如果有数据集路径）
+        dataset_path = getattr(self, 'test_dataset_path', None)
+        if dataset_path and os.path.exists(dataset_path):
+            print("[Test] Calculating FID score...")
+            try:
+                fid_output_file = os.path.join(tmp_dir, f'test_fid_step_{self.global_step}.txt')
+                script_path = str(project_root / 'eval_tool' / 'fid' / 'fid_score.py')
+                cmd_prefix = build_cmd_prefix(script_path)
+                cmd_args = f"{dataset_path} {test_output_dir} --max-samples {getattr(self, 'test_num_samples', 200)} --output {fid_output_file} --device {'cuda' if torch.cuda.is_available() else 'cpu'}"
+                cmd = f"{cmd_prefix} \\\n    {cmd_args}"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=project_root_str)
+                if result.returncode == 0:
+                    # 从输出文件读取结果
+                    if os.path.exists(fid_output_file):
+                        with open(fid_output_file, 'r') as f:
+                            content = f.read()
+                            # 匹配 "FID Score:" 或 "FID score:"（大小写不敏感）
+                            match = re.search(r'FID\s+[Ss]core:\s*([\d.]+)', content, re.IGNORECASE)
+                            if match:
+                                fid_value = float(match.group(1))
+                                metrics_results['fid'] = fid_value
+                                self.log('test/fid', fid_value, on_step=True, prog_bar=True)
+                                print(f"[Test] FID Score: {fid_value:.4f}")
+                            else:
+                                print(f"[Test] Failed to parse FID score from output file")
+                                print(f"[Test] File content preview: {content[:200]}")
+                else:
+                    print(f"[Test] FID calculation failed with return code {result.returncode}")
+                    print(f"[Test] Error: {result.stderr}")
+            except Exception as e:
+                print(f"[Test] FID calculation failed: {e}")
+        
+        # 5. 保存汇总结果到日志文件
+        with open(metrics_log_file, 'w', encoding='utf-8') as f:
+            f.write(f"Test Metrics at Step {self.global_step}\n")
+            f.write("="*60 + "\n\n")
+            for key, value in metrics_results.items():
+                f.write(f"{key}: {value:.6f}\n")
+            f.write("\n" + "="*60 + "\n")
+        
+        # 6. 记录到 wandb（类似 log_images 的方式）
+        self.log_test_metrics_to_wandb(metrics_results)
+        
+        print(f"\n[Test] All metrics calculated. Summary saved to {metrics_log_file}")
+        print(f"[Test] Metrics: {metrics_results}\n")
+    
+    def log_test_metrics_to_wandb(self, metrics_results):
+        """将测试指标记录到 wandb，类似 log_images 的方式"""
+        if not metrics_results:
+            return
+        
+        try:
+            # 方法1: 使用 wandb.Table 创建表格（推荐，更直观）
+            import wandb
+            
+            if wandb.run is not None:
+                # 创建指标表格
+                table = wandb.Table(columns=["Metric", "Value", "Step"])
+                for metric_name, metric_value in metrics_results.items():
+                    table.add_data(metric_name, f"{metric_value:.6f}", self.global_step)
+                
+                # 记录表格到 wandb
+                wandb.log({
+                    "test/metrics_table": table,
+                    "global_step": self.global_step
+                }, commit=False)
+                
+                # 方法2: 同时记录为单独的指标（用于绘制曲线图）
+                # 这些已经通过 self.log() 记录了，这里再记录一次确保同步
+                for metric_name, metric_value in metrics_results.items():
+                    wandb.log({
+                        f"test/{metric_name}": metric_value,
+                        "global_step": self.global_step
+                    }, commit=False)
+                
+                # 方法3: 记录汇总信息到 summary（可选）
+                # 只在特定步骤更新 summary（例如每1000步）
+                if self.global_step % 1000 == 0:
+                    summary_dict = {f"test_summary/{k}": v for k, v in metrics_results.items()}
+                    wandb.run.summary.update(summary_dict)
+                
+                # ⭐ 修复阻塞问题：不再强制提交，让wandb后台异步处理
+                # wandb.log({}, commit=True)  # 移除阻塞的提交
+                
+                # 打印详细的成功信息
+                print(f"[Test] ✅ Successfully logged {len(metrics_results)} metrics to wandb:")
+                for metric_name, metric_value in metrics_results.items():
+                    print(f"  - test/{metric_name}: {metric_value:.6f}")
+                print(f"[Test] Check wandb dashboard for:")
+                print(f"  - Table: test/metrics_table")
+                print(f"  - Plots: test/pose_distance, test/expression_distance, test/id_top1, test/id_top5, test/id_mean, test/fid")
+        except Exception as e:
+            print(f"[Test] ❌ Failed to log metrics to wandb: {e}")
+            import traceback
+            traceback.print_exc()
 
     @torch.no_grad()
     def log_images(self, batch, N=4, sample=True, ddim_steps=50, ddim_eta=1., return_keys=None, **kwargs):
         """
-        记录DPO训练的关键图片
+        记录DPO训练的关键图片（仅记录网络实际使用的）
         
         Args:
             batch: 数据批次
@@ -2112,12 +2824,12 @@ class LatentDiffusion(DDPM):
             
         Returns:
             log: 包含以下内容的字典
-                - src: 提供身份的人脸 (reference)
-                - tgt: 提供背景和姿态的图片（被遮罩的inpaint_image）
+                - src: 参考人脸（完整，用于ID loss，ref_img_raw）
+                - tgt: 目标图像（提供背景和姿态，被遮罩的inpaint_image）
                 - winner: 赢样本（好的换脸结果）
                 - loser: 输样本（差的换脸结果）
-                - output_current: 当前训练模型（EMA）生成的输出
-                - output_reference: 参考模型生成的输出
+                - output_current: 当前训练模型（EMA）生成的输出（可选）
+                - output_reference: 参考模型生成的输出（可选）
         """
         print(f"[DPO log_images] Called at step {self.global_step}, N={N}, sample={sample}")
         
@@ -2126,7 +2838,7 @@ class LatentDiffusion(DDPM):
             log = dict()
             
             print(f"[DPO log_images] Getting input data...")
-            z, _, c, x_w, x_l, xrec_w, xrec_l, reference, mask, _, gt, inpaint_src = self.get_input(batch, self.first_stage_key,
+            z, _, c, x_w, x_l, xrec_w, xrec_l, reference, mask, _, gt, inpaint_src, ref_raw = self.get_input(batch, self.first_stage_key,
                                             return_first_stage_outputs=True,
                                             force_c_encode=True,
                                             return_original_cond=True,
@@ -2134,18 +2846,27 @@ class LatentDiffusion(DDPM):
                                             get_reference=True,
                                             get_gt=True,
                                             get_inpaint=True,
+                                            get_ref_raw=True,  # ⭐ 新增：获取未mask的参考图像
                                             bs=N)
 
             N = min(x_w.shape[0], N)
             
-            # ✅ 只记录5个核心内容
+            # ✅ 只记录DPO实际用到的核心图像
             # src提供身份，tgt提供背景和姿态
-            log["src"] = reference      # 提供身份的人脸
-            log["tgt"] = inpaint_src    # 提供背景和姿态（被遮罩）
-            log["winner"] = x_w         # 赢样本
-            log["loser"] = x_l          # 输样本
+            if ref_raw is not None:
+                # 将 CLIP归一化 → [0,1] → 标准归一化[-1,1]
+                ref_raw_normalized = un_norm_clip(ref_raw)
+                ref_raw_normalized = TF.normalize(ref_raw_normalized, 
+                                                 mean=[0.5, 0.5, 0.5], 
+                                                 std=[0.5, 0.5, 0.5])
+                log["src"] = ref_raw_normalized    # Source: 完整的参考人脸（用于ID loss）
             
-            print(f"[DPO log_images] Added 4 base images (src, tgt, winner, loser)")
+            log["tgt"] = inpaint_src              # Target: 提供背景和姿态（被遮罩）
+            log["winner"] = x_w                   # Winner: 赢样本
+            log["loser"] = x_l                    # Loser: 输样本
+            
+            num_logged = len(log)
+            print(f"[DPO log_images] Added {num_logged} base images (src, tgt, winner, loser)")
 
             # 生成模型输出
             if sample:
@@ -2164,24 +2885,27 @@ class LatentDiffusion(DDPM):
                 log["output_current"] = x_samples_current  # 当前模型输出
                 print(f"[DPO log_images] Added current model output")
                 
-                # 2. 使用参考模型生成
-                print(f"[DPO log_images] Sampling with reference model...")
-                # 临时替换模型为参考模型
-                model_backup = self.model
-                self.model = self.model_ref
-                try:
-                    if self.first_stage_key == 'inpaint':
-                        samples_ref, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
-                                                    ddim_steps=ddim_steps, eta=ddim_eta, rest=z[:, 4:, :, :])
-                    else:
-                        samples_ref, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
-                                                    ddim_steps=ddim_steps, eta=ddim_eta)
-                    x_samples_ref = self.decode_first_stage(samples_ref)
-                    log["output_reference"] = x_samples_ref  # 参考模型输出
-                    print(f"[DPO log_images] Added reference model output")
-                finally:
-                    # 恢复原模型
-                    self.model = model_backup
+                # 2. 使用参考模型生成（仅在DPO模式下）
+                if self.model_ref is not None:
+                    print(f"[DPO log_images] Sampling with reference model...")
+                    # 临时替换模型为参考模型
+                    model_backup = self.model
+                    self.model = self.model_ref
+                    try:
+                        if self.first_stage_key == 'inpaint':
+                            samples_ref, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
+                                                        ddim_steps=ddim_steps, eta=ddim_eta, rest=z[:, 4:, :, :])
+                        else:
+                            samples_ref, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
+                                                        ddim_steps=ddim_steps, eta=ddim_eta)
+                        x_samples_ref = self.decode_first_stage(samples_ref)
+                        log["output_reference"] = x_samples_ref  # 参考模型输出
+                        print(f"[DPO log_images] Added reference model output")
+                    finally:
+                        # 恢复原模型
+                        self.model = model_backup
+                else:
+                    print(f"[SFT log_images] Skipping reference model (SFT mode)")
                     
             else:
                 print(f"[DPO log_images] Skipping model output (sample={sample})")

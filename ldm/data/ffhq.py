@@ -501,7 +501,8 @@ class FFHQdataset(data.Dataset):
         ref_image_tensor=img_p_np
         # resize mask_img
        
-    
+        # Create unmasked version for comparison
+        ref_image_tensor_nomask=ref_image_tensor.copy()
         
         # ref_image_tensor=self.random_trans(image=ref_image_tensor)
         ref_image_tensor=Image.fromarray(ref_image_tensor)
@@ -531,11 +532,18 @@ class FFHQdataset(data.Dataset):
         ref_image_tensor=self.random_trans(image=ref_image_tensor)
         ref_image_tensor=Image.fromarray(ref_image_tensor['image'].astype(np.uint8)) 
         ref_image_tensor=get_tensor_clip()(ref_image_tensor)
+        
+        # Process unmasked version - only resize to 224, no augmentations
+        ref_image_tensor_nomask=Image.fromarray(ref_image_tensor_nomask.astype(np.uint8))
+        ref_image_tensor_nomask=ref_image_tensor_nomask.resize((224, 224), Image.BILINEAR)  # Only resize to 224x224
+        ref_image_tensor_nomask=get_tensor_clip()(ref_image_tensor_nomask)
    
         if self.Fullmask:
-            return {"GT":image_tensor_resize,"inpaint_image":inpaint_tensor_resize,"inpaint_mask":mask_img_full,"ref_imgs":ref_image_tensor}
-   
-        return {"GT":image_tensor_resize,"inpaint_image":inpaint_tensor_resize,"inpaint_mask":mask_tensor_resize,"ref_imgs":ref_image_tensor}
+            return {"GT":image_tensor_resize,"inpaint_image":inpaint_tensor_resize,"inpaint_mask":mask_img_full,"ref_imgs":ref_image_tensor,"ref_imgs_nomask":ref_image_tensor_nomask}
+        
+        #修改后
+        ref_image_tensor=ref_image_tensor_nomask
+        return {"GT":image_tensor_resize,"inpaint_image":inpaint_tensor_resize,"inpaint_mask":mask_tensor_resize,"ref_imgs":ref_image_tensor,"ref_imgs_nomask":ref_image_tensor_nomask}
 
     def __getitem_black__(self, index):
         # black mask

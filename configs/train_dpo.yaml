@@ -16,10 +16,28 @@ model:
     monitor: train/loss_epoch
     u_cond_percent: 0.2
     scale_factor: 0.18215
-    use_ema: False
+    use_ema: True
     ref_ckpt_path: /data5/shuangjun.du/work/REFace/last.ckpt
     dpo_beta: 5000  # DPO 超参数，控制奖励函数的强度
+    use_sft_loss: False  # ⭐ 训练模式：True=SFT有监督微调，False=DPO偏好优化（默认）
     
+    ##test参数
+
+    test_during_training: true          # 启用训练时测试
+    test_interval_steps: 1000          # 每1000步测试一次
+    test_num_samples: 200              # 生成200个样本
+    test_batch_size: 10
+    test_dataset_name: "FFHQ"     # 数据集名称: CelebA, FFHQ, FF++
+    
+    # 测试数据路径
+    test_source_path: "/data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/Val"
+    test_target_path: "/data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/Val_target"
+    test_source_mask_path: "/data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/src_mask"
+    test_target_mask_path: "/data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/target_mask"
+    test_dataset_path: "/data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/images512"  # 用于FID
+    ####
+
+
     # DPO 辅助损失配置
     use_auxiliary_losses: False         # 是否使用辅助损失
     aux_diffusion_weight: 1.0          # 扩散重构损失权重（对赢样本）
@@ -129,15 +147,16 @@ data:
               remove_mask_tar: [1,2,4,5,8,9 ,6,7,10,11,12,17 ]
               preserve_mask_src: [1,2,4,5,8,9 ,6,7,10,11,12,13,17 ]
       test:
-          target: ldm.data.celebA.CelebAdataset
+          target: ldm.data.test_bench_dataset.FFHQdataset  # 使用FFHQ数据集（实际使用的数据集由test_dataset_name参数决定）
           params:
               state: test
-              dataset_dir: dataset/FaceData/CelebAMask-HQ/
+              dataset_dir: dataset/FaceData/FFHQ/  # FFHQ数据集路径
               arbitrary_mask_percent: 0.5
               image_size: 512
               gray_outer_mask: True
-              remove_mask_tar: [1,2,4,5,8,9 ,6,7,10,11,12,17 ]
-              preserve_mask_src: [1,2,4,5,8,9 ,6,7,10,11,12,13,17 ]
+              # FFHQ数据集使用专用的mask参数名（参考test_bench_dataset.py第490-492行）
+              remove_mask_tar_FFHQ: [1,2,3,5,6,7,9]  # FFHQ的mask标签：0:background, 1:lip, 2:eyebrows, 3:eyes, 4:hair, 5:nose, 6:skin, 7:ears, 8:belowface, 9:mouth, 10:eye_glass, 11:ear_rings
+              preserve_mask_src_FFHQ: [1,2,3,5,6,7,9]  # 保留源图像中的这些区域
 lightning:
   wandb:
     project: "Face_Swapping_DPO"  # wandb 项目名称
@@ -148,5 +167,5 @@ lightning:
     max_epochs: 20
     num_nodes: 1
     accelerator: 'gpu'
-    gpus: "0,1" #可见的gpu中选择哪些
+    gpus: "0" #可见的gpu中选择哪些
   

@@ -1,0 +1,11 @@
+FID Score Evaluation Results
+============================================================
+Real images path: /data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/images512
+Generated images path: /data5/shuangjun.du/work/REFace/results/FFHQ/REFace/results
+Batch size: 50
+Feature dimensions: 2048
+Max samples (generated only): 200
+Note: max_samples only applies to generated images, not real images.
+============================================================
+
+FID Score: 13.899072

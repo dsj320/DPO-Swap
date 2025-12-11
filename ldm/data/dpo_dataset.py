@@ -795,6 +795,14 @@ class DPOFaceDataset(data.Dataset):
         GT_l = tensor_resize_op(GT_l_full_tensor)
         base_img = tensor_resize_op(base_img_full_tensor)
         
+        # D. 保存未经mask处理的B和D
+        # 参考 celebA.py 的 ref_imgs_nomask 处理方式：
+        # - B图像(ref_img_raw): resize到224x224，使用CLIP归一化（用于CLIP特征提取）
+        # - D图像(tgt_img_raw): 保持标准归一化（base_img已处理，用于训练）
+        ref_pil_224 = ref_pil.resize((224, 224), Image.BILINEAR)
+        ref_img_raw = self.to_clip(ref_pil_224)  # B图像（未mask，224x224，CLIP归一化）
+        tgt_img_raw = base_img  # D图像（未mask，512x512，标准归一化）
+        
         # -----------------------------------------------------------------
         # 3. 处理 inpaint_mask (第一次随机调用, 顺序正确)
         # -----------------------------------------------------------------
@@ -835,12 +843,13 @@ class DPOFaceDataset(data.Dataset):
         tensor_unclip = un_norm_clip(tensor_clip)
         np_unclip_255 = 255. * rearrange(tensor_unclip, 'c h w -> h w c').cpu().numpy()
         
-        # H. 【Augment】(第二次随机调用)
-        ref_aug = self.random_trans(image=np_unclip_255.astype(np.uint8)) 
+        # H. 【不做数据增强，只 resize】⭐ 修改：去掉数据增强，保持稳定
+        # 原因：数据增强（翻转、旋转、模糊）会让参考图像变化太大，影响条件编码
+        ref_pil_processed = Image.fromarray(np_unclip_255.astype(np.uint8))
+        ref_pil_processed = ref_pil_processed.resize((224, 224), Image.BILINEAR)
         
         # I. 【Norm 2】
-        ref_aug_pil = Image.fromarray(ref_aug['image'])
-        ref_imgs = self.to_clip(ref_aug_pil)
+        ref_imgs = self.to_clip(ref_pil_processed)
         
         # -----------------------------------------------------------------
 
@@ -853,229 +862,14 @@ class DPOFaceDataset(data.Dataset):
             "inpaint_image": inpaint_image,   
             "inpaint_mask":  inpaint_mask,    
             "ref_imgs":      ref_imgs,        
+            # 新增：未经mask处理的B和D图像（用于SFT训练）
+            "ref_img_raw":   ref_img_raw,    # B图像（Source，未mask）
+            "tgt_img_raw":   tgt_img_raw,    # D图像（Target，未mask）
         }
             
         return out
 ########################DPOFaceDataset########################
 
 
-def set_seed(seed):
-        """设置所有随机种子以确保可复现性"""
-        
-        # --- [关键修复] 导入 cv2 ---
-        try:
-            import cv2
-            cv2.setRNGSeed(seed) # <--- 必须添加这一行
-        except ImportError:
-            print("警告: 未找到 cv2，无法设置 cv2 随机种子。")
-        
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-        print(f"设置所有随机种子 (torch, numpy, random, cv2) 为: {seed}")
-
-
-# -----------------------------------------------------
-# ---  DPO 数据集一致性验证脚本 ---
-# -----------------------------------------------------
-
-if __name__ == "__main__":
     
-    # --- 导入验证所需的库 ---
-    import os
-    import shutil
-    import json
-    import random
-    import numpy as np
-    import torch
-    from PIL import Image
-    # (脚本假设 CelebAdataset, DPOFaceDataset, get_tensor, get_tensor_clip,
-    #  un_norm_clip, rearrange, decow, A 等已在上面定义)
-
- 
-
-    def setup_test_environment(base_dir, preserve_list):
-        """创建所需的虚拟图片、Mask 和 JSON 文件"""
-        print(f"在 '{base_dir}' 中创建临时测试文件...")
-        
-        # --- 修复：创建 CelebAdataset 期望的子目录 ---
-        img_dir = os.path.join(base_dir, "CelebA-HQ-img")
-        mask_dir = os.path.join(base_dir, "CelebA-HQ-mask", "Overall_mask")
-        os.makedirs(img_dir, exist_ok=True)
-        os.makedirs(mask_dir, exist_ok=True)
-
-        # --- 修复：使用 CelebAdataset 会查找的路径 (0.jpg / 0.png) ---
-        img_path = os.path.join(img_dir, "0.jpg")
-        mask_path = os.path.join(mask_dir, "0.png")
-        json_path = os.path.join(base_dir, "dpo_manifest.json")
-        
-        img_size = 1024 # 基础高分辨率图像
-        
-        # A. 创建虚拟图像 (R, G, B, Y 四个象限)
-        img_data = np.zeros((img_size, img_size, 3), dtype=np.uint8)
-        hs = img_size // 2
-        img_data[0:hs, 0:hs, 0] = 255      # Red
-        img_data[0:hs, hs:img_size, 1] = 255  # Green
-        img_data[hs:img_size, 0:hs, 2] = 255  # Blue
-        img_data[hs:img_size, hs:img_size, 0:2] = 255 # Yellow
-        Image.fromarray(img_data).save(img_path)
-
-        # B. 创建虚拟 Mask (L 模式)
-        label_a = preserve_list[0]
-        label_b = preserve_list[1] if len(preserve_list) > 1 else label_a
-        label_c = 99 # 假设 99 不在 preserve 列表中
-        label_d = 0  # 背景
-        
-        mask_data = np.zeros((img_size, img_size), dtype=np.uint8)
-        mask_data[0:hs, 0:hs] = label_a
-        mask_data[0:hs, hs:img_size] = label_b
-        mask_data[hs:img_size, 0:hs] = label_c
-        mask_data[hs:img_size, hs:img_size] = label_d
-        Image.fromarray(mask_data, mode='L').save(mask_path)
-        
-        # C. 创建 DPO manifest.json (也必须指向新路径)
-        dpo_data = [
-            {
-              "path_B_source": img_path,       # Source (ref)
-              "path_B_mask":   mask_path,      # Source Mask
-              "path_D_mask":   mask_path,      # Target Mask
-              "path_A_chosen": img_path,       # Winner (使用 img.jpg)
-              "path_E_rejected":img_path,      # Loser (使用 img.jpg)
-              "path_D_target": img_path        # Target base (使用 img.jpg)
-            }
-        ]
-        with open(json_path, 'w') as f:
-            json.dump(dpo_data, f)
-        
-        print(f"  - 已创建: {img_path}")
-        print(f"  - 已创建: {mask_path}")
-        print("测试文件创建完毕。")
-        return json_path, base_dir
-
-    
-    # --- 1. 配置 ---
-    TEST_DIR = "_dpo_validation_temp"
-    
-    # 根据你的 config 文件 (image_297913.jpg)
-    PRESERVE_LIST = [1, 2, 4, 5, 8, 9, 6, 7, 10, 11, 12, 17]
-    IMG_SIZE = 512
-    
-    ARGS = {
-        "dataset_dir": TEST_DIR,
-        "image_size": IMG_SIZE,
-        "preserve_mask_src": PRESERVE_LIST,
-        "remove_mask_tar": PRESERVE_LIST,   # <--- 把这一行加进来
-        "preserve_mask": PRESERVE_LIST,     # (这个留着以防万一)
-        "gray_outer_mask": True,
-    }
-    
-    SEED = 30
-    ATOL = 1e-3 # 浮点数比较的容忍度
-
-    # --- 2. 执行 ---
-    try:
-        # A. 创建测试文件
-        json_path, base_dir = setup_test_environment(TEST_DIR, PRESERVE_LIST)
-
-        # B. 实例化两个 Dataset
-        print("\n实例化 Datasets...")
-        orig_dataset = CelebAdataset(state="train", **ARGS)
-        dpo_dataset = DPOFaceDataset(data_manifest_path=json_path, args=ARGS)
-
-        # C. 获取原始 Dataset 的输出
-        set_seed(SEED)
-        print("\n正在从 CelebAdataset (原始) 获取数据...")
-        orig_item = orig_dataset[0]
-        
-        print(f"  orig_item['ref_imgs'].shape:      {orig_item['ref_imgs'].shape}")
-        print(f"  orig_item['ref_imgs'].mean():     {orig_item['ref_imgs'].mean():.8f}")
-        print(f"  orig_item['inpaint_mask'].shape:  {orig_item['inpaint_mask'].shape}")
-        print(f"  orig_item['inpaint_mask'].mean(): {orig_item['inpaint_mask'].mean():.8f}")
-        print(f"  orig_item['GT'].shape:            {orig_item['GT'].shape}")
-        print(f"  orig_item['inpaint_image'].shape: {orig_item['inpaint_image'].shape}")
-
-
-        # D. 重置随机种子并获取 DPO Dataset 的输出
-        set_seed(SEED) # 必须重置！
-        print("\n正在从 DPOFaceDataset (新) 获取数据...")
-        dpo_item = dpo_dataset[0]
-        
-        print(f"  dpo_item['ref_imgs'].shape:      {dpo_item['ref_imgs'].shape}")
-        print(f"  dpo_item['ref_imgs'].mean():     {dpo_item['ref_imgs'].mean():.8f}")
-        print(f"  dpo_item['inpaint_mask'].shape:  {dpo_item['inpaint_mask'].shape}")
-        print(f"  dpo_item['inpaint_mask'].mean(): {dpo_item['inpaint_mask'].mean():.8f}")
-        print(f"  dpo_item['GT_w'].shape:           {dpo_item['GT_w'].shape}")
-        print(f"  dpo_item['inpaint_image'].shape: {dpo_item['inpaint_image'].shape}")
-
-
-        # E. 执行验证
-        print("\n" + "="*20 + " 开始验证 " + "="*20)
-        
-        # 验证 1: 'ref_imgs'
-        # (Source Img -> Source Mask -> __getitem_gray__ 独特逻辑 -> clip_norm)
-        print("正在检查 'ref_imgs'...")
-        ref_close = torch.allclose(orig_item['ref_imgs'], dpo_item['ref_imgs'], atol=ATOL)
-        assert ref_close, "验证失败: 'ref_imgs' 不一致！"
-        print("  [PASS] 'ref_imgs' 一致。")
-
-        # 验证 2: 'inpaint_mask'
-        # (Target Mask -> preserve -> resize(512) -> decow)
-        print("正在检查 'inpaint_mask'...")
-        mask_close = torch.allclose(orig_item['inpaint_mask'], dpo_item['inpaint_mask'], atol=ATOL)
-        assert mask_close, "验证失败: 'inpaint_mask' 不一致！"
-        print("  [PASS] 'inpaint_mask' 一致。")
-
-        # 验证 3: GT / GT_w
-        # (Target Img -> resize(512) -> norm[-1,1])
-        print("正在检查 'GT' (orig) vs 'GT_w' (dpo)...")
-        gt_close = torch.allclose(orig_item['GT'], dpo_item['GT_w'], atol=ATOL)
-        assert gt_close, "验证失败: 'GT' 和 'GT_w' 不一致！"
-        print("  [PASS] 'GT' / 'GT_w' 一致。")
-
-        # -----------------------------------------------------------------
-        # 验证 4: 'inpaint_image'
-        # 警告：此项验证可能会失败！
-        # -----------------------------------------------------------------
-        # 
-        #   在 DPOFaceDataset (dpo_item) 中, 逻辑是:
-        #     inpaint_image = base_img * (1.0 - inpaint_mask)  (正确逻辑)
-        #
-        #   请检查你的 CelebAdataset (orig_item) 中的 __getitem_gray__ 逻辑。
-        #   如果它是:
-        #     inpaint_tensor_resize = image_tensor_resize * mask_tensor_resize (错误逻辑)
-        #   ... 那么这项 assert 将会失败！
-        #
-        #   如果它失败了, 你有两个选择：
-        #   1. (推荐) 修复你的 CelebAdataset.__getitem_gray__ 中的 Bug, 
-        #      改成 `* (1.0 - mask_tensor_resize)`。
-        #   2. (不推荐) 修改 DPOFaceDataset, 故意复制这个 Bug。
-        #
-        print("正在检查 'inpaint_image'...")
-        inpaint_img_close = torch.allclose(orig_item['inpaint_image'], dpo_item['inpaint_image'], atol=ATOL)
-        assert inpaint_img_close, "验证失败: 'inpaint_image' 不一致！(请阅读代码中的警告)"
-        print("  [PASS] 'inpaint_image' 一致。")
-        # -----------------------------------------------------------------
-
-        print("\n" + "="*50)
-        print("✅ 验证成功！")
-        print("DPOFaceDataset 的所有输出格式与 CelebAdataset (__getitem_gray__) 完全一致。")
-        print("="*50)
-
-    except AssertionError as e:
-        print("\n" + "!"*50)
-        print(f"❌ 验证失败: {e}")
-        print("!"*50)
-    except Exception as e:
-        print("\n" + "!"*50)
-        print(f"❌ 发生意外错误: {e}")
-        import traceback
-        traceback.print_exc()
-        print("!"*50)
-
-    finally:
-        # F. 清理
-        if os.path.exists(TEST_DIR):
-            print(f"\n清理测试环境: {TEST_DIR}")
-            shutil.rmtree(TEST_DIR)
+  

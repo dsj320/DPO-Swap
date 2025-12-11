@@ -1784,7 +1784,7 @@ class LatentDiffusion(DDPM):
                             F.adaptive_avg_pool2d(other_pred_x_0[j],(512//2**i,512//2**i)), 
                             F.adaptive_avg_pool2d(GT_tar,(512//2**i,512//2**i))
                         ) 
-                        loss_dict.update({f'{prefix}/loss_lpips_{j}_{i}': loss_lpips_1})
+                        loss_dict.update({f'{prefix}/loss_l·pips_{j}_{i}': loss_lpips_1})
                         loss_lpips += loss_lpips_1
                 # for i in range(3):
                 #     loss_lpips_1 = self.lpips_loss(

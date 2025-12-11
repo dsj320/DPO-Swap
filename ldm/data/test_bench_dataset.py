@@ -351,7 +351,7 @@ class CelebAdataset(data.Dataset):
         mask_ref=T.Resize((224,224))(reference_mask_tensor)
    
         # breakpoint()
-        ref_img=ref_img*mask_ref   # comment here if you want the full ref img
+        # ref_img=ref_img*mask_ref   # ⭐ 注释掉：推理时使用完整的ref_img（未mask）
         ref_image_tensor = ref_img.unsqueeze(0)
         
         if self.load_prior:
@@ -625,7 +625,7 @@ class FFHQdataset(data.Dataset):
         mask_ref=T.Resize((224,224))(reference_mask_tensor)
    
         
-        ref_img=ref_img*mask_ref   # comment here if you want the full ref img
+        # ref_img=ref_img*mask_ref   # ⭐ 注释掉：推理时使用完整的ref_img（未mask）
         ref_image_tensor = ref_img.unsqueeze(0)
         
         if self.load_prior:
@@ -817,7 +817,7 @@ class FFdataset(data.Dataset):
         mask_ref=T.Resize((224,224))(reference_mask_tensor)
    
         
-        ref_img=ref_img*mask_ref   # comment here if you want the full ref img
+        # ref_img=ref_img*mask_ref   # ⭐ 注释掉：推理时使用完整的ref_img（未mask）
         ref_image_tensor = ref_img.unsqueeze(0)
         
         if self.load_prior:

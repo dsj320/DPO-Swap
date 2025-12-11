@@ -42,17 +42,14 @@ parser.add_argument('--mask', type=bool, default=True,
                     help='whether to use mask or not')
 parser.add_argument('--max-samples', type=int, default=None,
                     help='Maximum number of samples to evaluate. If None, evaluate all samples.')
-# parser.add_argument('--dims', type=int, default=2048,
-#                     choices=list(InceptionV3.BLOCK_INDEX_BY_DIM),
-#                     help=('Dimensionality of Inception features to use. '
-#                           'By default, uses pool3 features'))
 parser.add_argument('path', type=str, nargs=4,
                     default=['dataset/FaceData/CelebAMask-HQ/CelebA-HQ-img', 'results/test_bench/results','dataset/FaceData/CelebAMask-HQ/src_mask','dataset/FaceData/CelebAMask-HQ/target_mask'],
                     help=('Paths to the generated images or '
                           'to .npz statistic files'))
-
 parser.add_argument('--print_sim', type=bool, default=False,)
 parser.add_argument('--arcface', type=bool, default=False)
+parser.add_argument('--output', type=str, default=None,
+                    help='Output file path to save results. If None, only print to console.')
 IMAGE_EXTENSIONS = {'bmp', 'jpg', 'jpeg', 'pgm', 'png', 'ppm',
                     'tif', 'tiff', 'webp'}
 
@@ -178,14 +175,14 @@ class MaskedImagePathDataset(torch.utils.data.Dataset):
         ref_mask_img = Image.open(mask_path).convert('L')
         ref_mask_img = np.array(ref_mask_img)  # Convert the label to a NumPy array if it's not already
 
-        if self.data_name=="celeba":
-            preserve = [1,2,4,5,8,9 ,6,7,10,11,12 ]
-        elif self.data_name=="ffhq":
-            preserve = [1,2,3,5,6,7,9]
-        elif self.data_name=="ff++":
-            preserve = [1,2,4,5,8,9 ]
-        else:
-            preserve=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]  # No mask
+        # if self.data_name=="celeba":
+        #     preserve = [1,2,4,5,8,9 ,6,7,10,11,12 ]
+        # elif self.data_name=="ffhq":
+        #     preserve = [1,2,3,5,6,7,9]
+        # elif self.data_name=="ff++":
+        #     preserve = [1,2,4,5,8,9 ]
+        # else:
+        preserve=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]  # No mask
         # preserve = [1,2,4,5,8,9 ,6,7,10,11,12 ] # CelebA-HQ
         # preserve = [1,2,3,5,6,7,9]  # FFHQ or FF++
         # print("preserve:",preserve)
@@ -205,6 +202,31 @@ class MaskedImagePathDataset(torch.utils.data.Dataset):
         ref_img=get_tensor()(ref_img)
         ref_img=ref_img*mask_ref
         image = ref_img.unsqueeze(0)
+
+        #保存这些图片
+        # Convert tensor back to PIL Image for saving
+        # ref_img is normalized to [-1, 1], need to denormalize to [0, 1]
+        ref_img_denorm = (ref_img + 1.0) / 2.0  # Denormalize from [-1, 1] to [0, 1]
+        ref_img_denorm = torch.clamp(ref_img_denorm, 0, 1)  # Ensure values are in [0, 1]
+        # Convert to numpy and transpose from (C, H, W) to (H, W, C)
+        ref_img_np = ref_img_denorm.cpu().numpy().transpose(1, 2, 0)
+        # Convert to uint8
+        ref_img_np = (ref_img_np * 255).astype(np.uint8)
+        # Convert to PIL Image
+        ref_img_pil = Image.fromarray(ref_img_np)
+        
+        # Get output directory (tmp folder at the same level as REFace)
+        script_dir = pathlib.Path(__file__).parent.parent.parent
+        output_dir = script_dir / 'tmp/ffhq_results_without_mask'
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Generate output filename from input filename
+        input_filename = pathlib.Path(path).stem
+        output_filename = f"{input_filename}_masked.png"
+        output_path = output_dir / output_filename
+        
+        # Save the image
+        ref_img_pil.save(output_path)
         
         
         
@@ -230,23 +252,6 @@ class MaskedImagePathDataset(torch.utils.data.Dataset):
 
 def compute_features(files,mask_files, model,other_model, batch_size=50, dims=2048, device='cpu',
                     num_workers=1,data_name="celeba"):
-    """Calculates the activations of the pool_3 layer for all images.
-    Params:
-    -- files       : List of image files paths
-    -- model       : Instance of inception model
-    -- batch_size  : Batch size of images for the model to process at once.
-                     Make sure that the number of samples is a multiple of
-                     the batch size, otherwise some samples are ignored. This
-                     behavior is retained to match the original FID score
-                     implementation.
-    -- dims        : Dimensionality of features returned by Inception
-    -- device      : Device to run calculations
-    -- num_workers : Number of parallel dataloader workers
-    Returns:
-    -- A numpy array of dimension (num images, dims) that contains the
-       activations of the given tensor when feeding inception with the
-       query tensor.
-    """
     model.eval()
 
     if batch_size > len(files):
@@ -295,10 +300,26 @@ def compute_features_wrapp(path,mask_path, IDLoss_model,Other_model, batch_size,
         path = pathlib.Path(path)
         files = natsorted([file for ext in IMAGE_EXTENSIONS
                        for file in path.glob('*.{}'.format(ext))])
+        # Extract all numbers before limiting files to ensure consistent indexing
+        # breakpoint()
+        pattern = r'[_\/.-]'
+
+        # Split the file path using the pattern
+        parts_all = [re.split(pattern, str(file.name)) for file in files]
+        # breakpoint()
+        # Filter out non-numeric parts and convert to integers
+        numbers_all =[[int(par) for par in part if par.isdigit()] for part in parts_all]
+        
+        numbers_all= [ num[0] for num in numbers_all if len(num)>0]
+        # breakpoint()
+        # Calculate minimum from ALL files before limiting
+        mi_num= min(numbers_all)
+        
         # 限制评估样本数量
         if max_samples is not None and len(files) > max_samples:
             print(f"Limiting ID evaluation to first {max_samples} samples (out of {len(files)})")
             files = files[:max_samples]
+            numbers_all = numbers_all[:max_samples]
         # breakpoint()
         mask_path = pathlib.Path(mask_path)
         mask_files = natsorted([file for ext in IMAGE_EXTENSIONS
@@ -306,21 +327,10 @@ def compute_features_wrapp(path,mask_path, IDLoss_model,Other_model, batch_size,
         # 也限制mask文件数量
         if max_samples is not None and len(mask_files) > max_samples:
             mask_files = mask_files[:max_samples]
-        # Extract all numbers before the dot using regular expression
-        # breakpoint()
-        pattern = r'[_\/.-]'
-
-        # Split the file path using the pattern
-        parts = [re.split(pattern, str(file.name)) for file in files]
-        # breakpoint()
-        # Filter out non-numeric parts and convert to integers
-        numbers =[[int(par) for par in part if par.isdigit()] for part in parts]
         
-        numbers= [ num[0] for num in numbers if len(num)>0]
-        # breakpoint()
-        mi_num= min(numbers)
-        # if numbers[0]>28000: # CelebA-HQ Test my split #check 28000-29000: target 29000-30000: source
-        numbers = [(num - mi_num) for num in numbers] # celeb
+        # Use position indices instead of file name numbers to ensure consistency
+        # Files are already sorted, so position index [0, 1, 2, ..., N-1] is correct
+        numbers = list(range(len(files)))
         # breakpoint()
         pred_arr = compute_features(files,mask_files, IDLoss_model,Other_model, batch_size,
                                                dims, device, num_workers,data_name=data_name)
@@ -396,15 +406,60 @@ def main():
                                           2048,
                                           num_workers,data_name=args.dataset,args=args,max_samples=args.max_samples)
     
-    
-    print('Top-1 accuracy: {:.2f}%'.format(top1 * 100))
-    print('Top-5 accuracy: {:.2f}%'.format(top5 * 100))
-    print('Mean ID feat:  {:.2f}'.format(Mean_dot_prod))
+    # Prepare output
+    output_lines = []
+    output_lines.append('Top-1 accuracy: {:.2f}%'.format(top1 * 100))
+    output_lines.append('Top-5 accuracy: {:.2f}%'.format(top5 * 100))
+    output_lines.append('Mean ID feat:  {:.2f}'.format(Mean_dot_prod))
     
     if args.print_sim:
-        print('Similarities: \n ')
+        output_lines.append('Similarities: \n ')
         for i in range(len(similarities)):
-            print(i,":",similarities[i])
+            output_lines.append('{}: {:.6f}'.format(i, similarities[i]))
+    
+    # Print to console
+    for line in output_lines:
+        print(line)
+    
+    # Write to file if output path is specified
+    if args.output:
+        output_path = pathlib.Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            for line in output_lines:
+                f.write(line + '\n')
+        print(f'\nResults saved to: {output_path}')
 
 if __name__ == '__main__':
     main()
+
+"""
+CUDA_VISIBLE_DEVICES=3 \
+PYTHONPATH="/data5/shuangjun.du/work/REFace:$PYTHONPATH" \
+    python /data5/shuangjun.du/work/REFace/eval_tool/ID_retrieval/ID_retrieval.py \
+    /data5/shuangjun.du/work/REFace/dataset/FaceData/CelebAMask-HQ/Val_target_512 \
+    /data5/shuangjun.du/work/REFace/results/CelebA/REFace/results \
+    /data5/shuangjun.du/work/REFace/dataset/FaceData/CelebAMask-HQ/src_mask \
+    /data5/shuangjun.du/work/REFace/dataset/FaceData/CelebAMask-HQ/target_mask \
+    --max-samples 100 \
+    --print_sim True \
+    --output tmp/id_retrieval_celeba_100_without_mask.txt \
+    --arcface True \
+    --dataset 1
+
+
+CUDA_VISIBLE_DEVICES=3 \
+PYTHONPATH="/data5/shuangjun.du/work/REFace:$PYTHONPATH" \
+    python /data5/shuangjun.du/work/REFace/eval_tool/ID_retrieval/ID_retrieval.py \
+    /data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/Val \
+    /data5/shuangjun.du/work/REFace/results/FFHQ/REFace/results \
+    /data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/src_mask \
+    /data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/target_mask \
+    --max-samples 200 \
+    --print_sim True \
+    --output tmp/id_retrieval_ffhq_200_without_mask.txt \
+    --arcface True \
+    --dataset 1
+
+"""
+

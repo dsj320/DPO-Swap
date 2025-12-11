@@ -439,6 +439,9 @@ class CelebAdataset(data.Dataset):
         mask_tensor_resize=decow(mask_tensor_resize.unsqueeze(0) ,scale=scale).squeeze(0)
         inpaint_tensor_resize=image_tensor_resize*mask_tensor_resize
         
+        # Create unmasked version for comparison
+        ref_image_tensor_nomask=ref_image_tensor.clone()
+        
         mask_ref=1-T.Resize([1024,1024])(mask_tensor)
         ref_image_tensor=ref_image_tensor*mask_ref
         
@@ -448,11 +451,19 @@ class CelebAdataset(data.Dataset):
         ref_image_tensor=self.random_trans(image=ref_image_tensor)
         ref_image_tensor=Image.fromarray(ref_image_tensor['image'].astype(np.uint8)) 
         ref_image_tensor=get_tensor_clip()(ref_image_tensor)
+        
+        # Process unmasked version - only resize to 224, no augmentations
+        ref_image_tensor_nomask=255.* rearrange(un_norm_clip(ref_image_tensor_nomask), 'c h w -> h w c').cpu().numpy()
+        ref_image_tensor_nomask=Image.fromarray(ref_image_tensor_nomask.astype(np.uint8)) 
+        ref_image_tensor_nomask=ref_image_tensor_nomask.resize((224, 224), Image.BILINEAR)  # Only resize to 224x224
+        ref_image_tensor_nomask=get_tensor_clip()(ref_image_tensor_nomask)
    
         if self.Fullmask:
-            return {"GT":image_tensor_resize,"inpaint_image":inpaint_tensor_resize,"inpaint_mask":mask_img_full,"ref_imgs":ref_image_tensor}
-   
-        return {"GT":image_tensor_resize,"inpaint_image":inpaint_tensor_resize,"inpaint_mask":mask_tensor_resize,"ref_imgs":ref_image_tensor}
+            return {"GT":image_tensor_resize,"inpaint_image":inpaint_tensor_resize,"inpaint_mask":mask_img_full,"ref_imgs":ref_image_tensor,"ref_imgs_nomask":ref_image_tensor_nomask}
+
+        #修改后
+        ref_image_tensor=ref_image_tensor_nomask
+        return {"GT":image_tensor_resize,"inpaint_image":inpaint_tensor_resize,"inpaint_mask":mask_tensor_resize,"ref_imgs":ref_image_tensor,"ref_imgs_nomask":ref_image_tensor_nomask}
 
     def __getitem_black__(self, index):
         # black mask
@@ -514,7 +525,7 @@ class CelebAdataset(data.Dataset):
         image_tensor_resize=T.Resize([self.args['image_size'],self.args['image_size']])(image_tensor_cropped)
         mask_tensor_resize=T.Resize([self.args['image_size'],self.args['image_size']])(mask_tensor_cropped)
         inpaint_tensor_resize=image_tensor_resize*mask_tensor_resize
-   
+
         return {"GT":image_tensor_resize,"inpaint_image":inpaint_tensor_resize,"inpaint_mask":mask_tensor_resize,"ref_imgs":ref_image_tensor}
    
    

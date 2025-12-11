@@ -24,6 +24,7 @@ from pytorch_lightning.plugins.environments import ClusterEnvironment,SLURMEnvir
 import wandb
 wandb.login(key="f0a412d675fd5439a95ac8369fe5fe7b6acf6fc7")
 
+
 def get_parser(**parser_kwargs):
     def str2bool(v):
         if isinstance(v, bool):
@@ -62,7 +63,7 @@ def get_parser(**parser_kwargs):
         metavar="base_config.yaml",
         help="paths to base configs. Loaded from left-to-right. "
              "Parameters can be overwritten or added with command-line options of the form `--key value`.",
-        default=["configs/debug.yaml"],
+        default=["configs/train_dpo.yaml"],  # 修改默认值为train_dpo.yaml
     )
     parser.add_argument(
         "-t",
@@ -348,7 +349,7 @@ class ImageLogger(Callback):
 
     @rank_zero_only
     def _wandb(self, pl_module, images, batch_idx, split):
-        """记录图像到 wandb - 拼接成 2 行布局（处理不同尺寸）"""
+        """记录图像到 wandb - 拼接成 2 行布局（处理不同尺寸）- 非阻塞版本"""
         try:
             print(f"[_wandb] Called with {len(images)} images: {list(images.keys())}")
             
@@ -437,7 +438,8 @@ class ImageLogger(Callback):
                 final_img = pil_row2
                 print(f"[_wandb] Only row 2: {final_img.size}")
             
-            # 记录到 wandb - 只记录一个拼接后的大图
+            # ⭐ 关键修改：使用 commit=False 避免阻塞
+            # wandb会在后台异步上传，不会阻塞训练
             wandb_log = {
                 f"{split}/all_samples": wandb.Image(
                     final_img,
@@ -445,16 +447,9 @@ class ImageLogger(Callback):
                 )
             }
             
-            wandb.log(wandb_log, commit=True)
-            print(f"✓ Successfully logged grid to wandb")
-            
-            # 强制同步
-            try:
-                if hasattr(wandb.run, '_file_pusher') and wandb.run._file_pusher:
-                    wandb.run._file_pusher.push()
-                print(f"✓ Forced sync to wandb server")
-            except Exception as sync_err:
-                print(f"⚠ Sync warning: {sync_err}")
+            # ⭐ commit=False: 不立即同步，由wandb后台处理
+            wandb.log(wandb_log, commit=False)
+            print(f"✓ Successfully queued image to wandb (non-blocking)")
                 
         except Exception as e:
             print(f"✗ ERROR logging images to wandb: {e}")
@@ -546,19 +541,26 @@ class ImageLogger(Callback):
     
     @rank_zero_only
     def on_train_epoch_end(self, trainer, pl_module, unused=None):
-        """每个 epoch 结束时强制同步 wandb"""
+        """每个 epoch 结束时的回调 - 完全非阻塞版本"""
         try:
-            import wandb
+            current_epoch = pl_module.current_epoch
+            global_step = pl_module.global_step
+            print(f"\n{'='*80}")
+            print(f"[ImageLogger] ✅ Epoch {current_epoch} completed (global_step={global_step})")
+            
+            # ⭐ 关键：只记录metrics，不做任何同步操作
             if wandb.run is not None:
-                print(f"[ImageLogger] Syncing wandb at epoch end...")
-                # 强制刷新所有待上传的数据
-                if hasattr(wandb.run, '_file_pusher') and wandb.run._file_pusher:
-                    wandb.run._file_pusher.push()
-                if hasattr(wandb.run, '_backend') and wandb.run._backend:
-                    wandb.run._backend.interface.publish_files()
-                print(f"[ImageLogger] Wandb sync complete")
+                # 使用 commit=False 避免阻塞
+                wandb.log({"epoch": current_epoch}, commit=False, step=global_step)
+                print(f"[ImageLogger] Logged epoch completion to wandb (non-blocking)")
+            
+            print(f"[ImageLogger] Moving to next epoch...")
+            print(f"{'='*80}\n")
+            
         except Exception as e:
-            print(f"[ImageLogger] Wandb sync failed: {e}")
+            print(f"[ImageLogger] on_train_epoch_end error: {e}, continuing training...")
+            # 确保不会因为wandb错误而中断训练
+            pass
 
 
 class CUDACallback(Callback):
@@ -568,19 +570,29 @@ class CUDACallback(Callback):
         torch.cuda.reset_peak_memory_stats(trainer.root_gpu)
         torch.cuda.synchronize(trainer.root_gpu)
         self.start_time = time.time()
+        print(f"\n[CUDACallback] 🚀 Starting Epoch {pl_module.current_epoch}...")
 
     def on_train_epoch_end(self, trainer, pl_module, outputs):
-        torch.cuda.synchronize(trainer.root_gpu)
-        max_memory = torch.cuda.max_memory_allocated(trainer.root_gpu) / 2 ** 20
-        epoch_time = time.time() - self.start_time
-
+        """记录epoch结束时的统计信息 - 完全非阻塞版本"""
         try:
-            max_memory = trainer.training_type_plugin.reduce(max_memory)
-            epoch_time = trainer.training_type_plugin.reduce(epoch_time)
+            # ⭐ 不进行CUDA同步，避免阻塞
+            max_memory = torch.cuda.max_memory_allocated(trainer.root_gpu) / 2 ** 20
+            epoch_time = time.time() - self.start_time
 
-            rank_zero_info(f"Average Epoch time: {epoch_time:.2f} seconds")
-            rank_zero_info(f"Average Peak memory {max_memory:.2f}MiB")
-        except AttributeError:
+            rank_zero_info(f"[CUDACallback] Epoch time: {epoch_time:.2f} seconds")
+            rank_zero_info(f"[CUDACallback] Peak memory: {max_memory:.2f}MiB")
+            
+            # ⭐ 使用 commit=False 记录到wandb，避免阻塞
+            if wandb.run is not None:
+                wandb.log({
+                    "train/epoch_time_seconds": epoch_time,
+                    "train/peak_memory_MiB": max_memory
+                }, commit=False, step=pl_module.global_step)
+            
+            print(f"[CUDACallback] ✅ Epoch {pl_module.current_epoch} metrics recorded (non-blocking)")
+        except Exception as e:
+            print(f"[CUDACallback] Error in on_train_epoch_end: {e}, continuing...")
+            # 确保不会因为错误而中断训练
             pass
 
 
@@ -650,24 +662,33 @@ if __name__ == "__main__":
     lightning_config = config.pop("lightning", OmegaConf.create())
     # merge trainer cli with config
     trainer_config = lightning_config.get("trainer", OmegaConf.create())
-    # default to ddp
-    trainer_config["accelerator"] = "ddp"
     for k in nondefault_trainer_args(opt):
         trainer_config[k] = getattr(opt, k)
-    if not "gpus" in trainer_config and not "devices" in trainer_config:
-        del trainer_config["accelerator"]
-        cpu = True
-    elif "devices" in trainer_config:
-        print("Using devices:", trainer_config["devices"])
-        print("using nodes:", trainer_config["num_nodes"])
+
+    # 与 main.py 保持一致：只要提供了 gpus/devices 就启用 GPU；否则退回 CPU
+    if "gpus" in trainer_config or "devices" in trainer_config:
+        # 将旧的 gpus 配置映射到 devices，避免 PL 对缺少 gpus 的报错
+        if "devices" not in trainer_config and "gpus" in trainer_config:
+            g = trainer_config["gpus"]
+            if isinstance(g, str):
+                gpu_ids = [x for x in g.replace(" ", "").split(",") if x != ""]
+                devices = len(gpu_ids) if gpu_ids else 1
+            elif isinstance(g, int):
+                devices = g if g > 0 else 1
+            else:
+                devices = 1
+            trainer_config["devices"] = devices
         trainer_config["accelerator"] = "gpu"
-        trainer_config["strategy"] = "ddp"
-        trainer_config["gpus"] = "0, 1, 2, 3"
+        # 多卡时默认 ddp；单卡则不强制 strategy
+        if trainer_config.get("devices", 1) and trainer_config["devices"] > 1:
+            trainer_config.setdefault("strategy", "ddp")
         cpu = False
+        print(f"Using accelerator=gpu, devices={trainer_config['devices']}")
     else:
-        gpuinfo = trainer_config["gpus"]
-        print(f"Running on GPUs {gpuinfo}")
-        cpu = False
+        trainer_config.pop("accelerator", None)
+        cpu = True
+        print("Running on CPU")
+
     trainer_opt = argparse.Namespace(**trainer_config)
     lightning_config.trainer = trainer_config
     
@@ -703,17 +724,37 @@ if __name__ == "__main__":
         rank = 0
     
     if rank == 0:
-        # 配置 wandb settings - 强制在线模式并立即同步
+        # ⭐ 方案选择说明：
+        # - WANDB_MODE="disabled": 完全禁用wandb（推荐，避免阻塞）
+        # - WANDB_MODE="offline": 离线模式，数据保存本地（可后续手动同步）
+        # - WANDB_MODE="online": 在线模式（已优化非阻塞，但仍可能有网络延迟）
+        
+        wandb_mode = os.environ.get("WANDB_MODE", "online")
+        print(f"[WANDB Rank {rank}] Mode: {wandb_mode}")
+        
+        # ⭐ 配置 wandb settings - 非阻塞模式
         wandb_settings = wandb.Settings(
-            mode="online",         # ✅ 强制在线模式
+            mode=wandb_mode,       # 使用环境变量控制模式
             start_method="fork",   # 多进程兼容
             _disable_stats=False,  # 启用系统统计
             _disable_meta=False,   # 启用元数据
             _save_requirements=False,  # 不保存 requirements
             _file_stream_timeout_seconds=30,  # 文件流超时
-            # _file_pusher_timeout_seconds=30,  # 已移除：旧版本参数，不再支持
+            # ⭐ 关键设置：禁用阻塞式同步
+            # _sync_media_timeout=10,  # 媒体同步超时10秒 (此参数在新版wandb中不支持，已注释)
+            _stats_sample_rate_seconds=30,  # 降低统计采样频率
+            _stats_samples_to_average=10,  # 统计样本平均数
         )
         
+        print(f"[WANDB Rank {rank}] Initializing with mode={wandb_mode}")
+    else:
+        print(f"[WANDB Rank {rank}] Skipping wandb init (not main process)")
+        # ⭐ 重要：非主进程完全不使用wandb，避免DDP死锁
+        os.environ["WANDB_MODE"] = "disabled"
+        wandb_mode = "disabled"
+    
+    # ⭐ 只有rank 0才初始化wandb
+    if rank == 0:
         # 确保 wandb 目录有写权限
         wandb_dir = os.path.join(logdir, "wandb")
         os.makedirs(wandb_dir, exist_ok=True)
@@ -724,9 +765,9 @@ if __name__ == "__main__":
             with open(test_file, 'w') as f:
                 f.write("test")
             os.remove(test_file)
-            print(f"[WANDB] Using wandb dir: {wandb_dir}")
+            print(f"[WANDB Rank {rank}] Using wandb dir: {wandb_dir}")
         except Exception as e:
-            print(f"[WANDB] WARNING: {wandb_dir} not writable ({e}), using /tmp")
+            print(f"[WANDB Rank {rank}] WARNING: {wandb_dir} not writable ({e}), using /tmp")
             wandb_dir = "/tmp/wandb_logs"
             os.makedirs(wandb_dir, exist_ok=True)
         
@@ -762,18 +803,24 @@ if __name__ == "__main__":
     
     # ------------------- 修改后的加载逻辑开始 -------------------
     if not opt.resume:
-        # 这是“开始新DPO训练”的逻辑
-        print(f"Loading base model for NEW DPO training from: {opt.pretrained_model}")
+        # 这是"开始新DPO训练"的逻辑
+        print(f"Loading base model for NEW training from: {opt.pretrained_model}")
         if not os.path.exists(opt.pretrained_model):
             raise FileNotFoundError(f"Cannot find pretrained model at {opt.pretrained_model}")
 
         # 1. 加载基础模型 (e.g., sd-v1-4.ckpt) 的 state dict
         base_sd = torch.load(opt.pretrained_model, map_location='cpu')['state_dict']
         
-        # 2. 创建一个新的 state_dict，用于同时填充 policy_model (model) 和 ref_model (model_ref)
+        # 2. 创建一个新的 state_dict
         dpo_state_dict = {}
         
-        print("Copying base weights to policy (model.*) and reference (model_ref.*)...")
+        # 检查是否使用 SFT 模式
+        use_sft_mode = config.model.params.get('use_sft_loss', False)
+        
+        if use_sft_mode:
+            print("✓ SFT 模式：只加载策略模型权重（跳过参考模型，节省显存）")
+        else:
+            print("DPO 模式：加载策略模型和参考模型权重...")
         
         total_copied_to_ref = 0
         
@@ -786,32 +833,38 @@ if __name__ == "__main__":
             # - self.model.* (即 策略模型/Policy Model)
             dpo_state_dict[key] = value
 
-            # 3b. 检查这个键是否属于 UNet (根据你的错误日志, UNet 键以 "model.diffusion_model" 开头)
-            unet_prefix = "model.diffusion_model"
-            if key.startswith(unet_prefix):
-                
-                # 3c. 为参考模型(Reference Model)创建对应的键
-                # 例如: "model.diffusion_model.X" -> "model_ref.diffusion_model.X"
-                # (注意: "model." 被替换为 "model_ref.")
-                ref_key = "model_ref." + key[len("model."):] 
-                
-                # 3d. 为参考模型添加权重的 *副本*
-                dpo_state_dict[ref_key] = value.clone()
-                total_copied_to_ref += 1
+            # 3b. ⭐ 只在 DPO 模式下复制参考模型权重
+            if not use_sft_mode:
+                # 检查这个键是否属于 UNet (根据你的错误日志, UNet 键以 "model.diffusion_model" 开头)
+                unet_prefix = "model.diffusion_model"
+                if key.startswith(unet_prefix):
+                    
+                    # 3c. 为参考模型(Reference Model)创建对应的键
+                    # 例如: "model.diffusion_model.X" -> "model_ref.diffusion_model.X"
+                    # (注意: "model." 被替换为 "model_ref.")
+                    ref_key = "model_ref." + key[len("model."):] 
+                    
+                    # 3d. 为参考模型添加权重的 *副本*
+                    dpo_state_dict[ref_key] = value.clone()
+                    total_copied_to_ref += 1
 
         print(f"Total keys in base model: {len(base_sd)}")
-        print(f"Total keys copied to ref_model (UNet only): {total_copied_to_ref}")
+        if not use_sft_mode:
+            print(f"Total keys copied to ref_model (UNet only): {total_copied_to_ref}")
+        else:
+            print(f"SFT 模式：跳过参考模型权重复制")
 
         # 4. 将这个合并后的 state_dict 加载到你的 LatentDiffusion 模型中
         #    使用 strict=False 是常规操作，因为基础模型 state_dict 包含 VAE 和 CLIP，
         #    而你的 LatentDiffusion 类本身没有直接定义它们 (它们在 first_stage_model 等子模块中)
         missing_keys, unexpected_keys = model.load_state_dict(dpo_state_dict, strict=False)
         
-        print(f"Successfully loaded weights for DPO.")
+        print(f"Successfully loaded weights.")
         print(f"  Missing Keys: {len(missing_keys)}")
         print(f"  Unexpected Keys: {len(unexpected_keys)}")
         
-        if total_copied_to_ref == 0:
+        # ⭐ 只在 DPO 模式下检查参考模型
+        if not use_sft_mode and total_copied_to_ref == 0:
             print("\n\n*** 严重警告 ***")
             print("在您的预训练模型中没有找到任何 'model.diffusion_model' 开头的键。")
             print("这意味着您的 'model_ref' (参考模型) 没有被正确初始化，DPO 训练将失败。")
@@ -819,9 +872,9 @@ if __name__ == "__main__":
             print("************************\n\n")
 
     else:
-        # 这是“恢复DPO训练”的逻辑
+        # 这是"恢复训练"的逻辑
         # (当你使用 -r 时，trainer.fit() 会自动加载检查点, 无需额外代码)
-        print(f"Resuming existing DPO training from DPO checkpoint: {opt.resume_from_checkpoint}")
+        print(f"Resuming training from checkpoint: {opt.resume_from_checkpoint}")
     
     # ------------------- 修改后的加载逻辑结束 -------------------
 
@@ -950,6 +1003,14 @@ if __name__ == "__main__":
 
     trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
 
+    # 使用新的 devices API，避免 gpus 缺失导致的 Misconfiguration
+    if "devices" not in trainer_kwargs and "devices" in trainer_config:
+        trainer_kwargs["devices"] = trainer_config["devices"]
+    if "accelerator" not in trainer_kwargs and "accelerator" in trainer_config:
+        trainer_kwargs["accelerator"] = trainer_config["accelerator"]
+    if trainer_config.get("devices", 1) > 1 and "strategy" in trainer_config:
+        trainer_kwargs.setdefault("strategy", trainer_config["strategy"])
+
     trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
     # trainer.plugins = [MyCluster()]
     trainer.logdir = logdir  ###
@@ -968,7 +1029,14 @@ if __name__ == "__main__":
     # configure learning rate
     bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
     if not cpu:
-        ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
+        # 处理 gpus 参数可能是字符串或整数的情况
+        gpus_param = lightning_config.trainer.gpus
+        if isinstance(gpus_param, str):
+            ngpu = len(gpus_param.strip(",").split(','))
+        elif isinstance(gpus_param, int):
+            ngpu = gpus_param if gpus_param > 0 else 1
+        else:
+            ngpu = 1
     else:
         ngpu = 1
     if 'accumulate_grad_batches' in lightning_config.trainer:
@@ -1008,16 +1076,102 @@ if __name__ == "__main__":
 
 
     import signal
+    import atexit
+    import threading
+
+    # 创建一个标志来跟踪是否已经保存过checkpoint（避免重复保存）
+    _checkpoint_saved = threading.Lock()
+    _saving_checkpoint = False
+    _interrupt_count = 0  # 记录中断次数
+
+    def safe_save_checkpoint():
+        """安全地保存checkpoint，避免重复保存"""
+        global _saving_checkpoint
+        with _checkpoint_saved:
+            if _saving_checkpoint:
+                return  # 已经在保存中，跳过
+            _saving_checkpoint = True
+        
+        try:
+            # 检查trainer是否已初始化且是主进程
+            if trainer is not None:
+                # 在多进程环境下，只有rank 0保存
+                if hasattr(trainer, 'global_rank'):
+                    if trainer.global_rank == 0:
+                        print("\n[Checkpoint] Saving checkpoint...")
+                        melk()
+                        print("[Checkpoint] Checkpoint saved successfully.")
+                else:
+                    # 单进程环境
+                    print("\n[Checkpoint] Saving checkpoint...")
+                    melk()
+                    print("[Checkpoint] Checkpoint saved successfully.")
+        except Exception as e:
+            print(f"[Checkpoint] Error saving checkpoint: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            with _checkpoint_saved:
+                _saving_checkpoint = False
+
+    # 注册退出时的清理函数，确保进程退出时保存checkpoint
+    def save_checkpoint_on_exit():
+        """进程退出时保存checkpoint"""
+        safe_save_checkpoint()
+    
+    # 注册atexit处理函数（注意：SIGKILL无法被捕获，但SIGTERM可以）
+    atexit.register(save_checkpoint_on_exit)
+
+    # 处理SIGTERM信号（kill命令默认发送的信号）
+    def sigterm_handler(signum, frame):
+        """处理SIGTERM信号（kill命令）"""
+        print(f"\n[SIGTERM] Received termination signal (kill)")
+        safe_save_checkpoint()
+        print("[SIGTERM] Exiting...")
+        # 使用os._exit强制退出，避免被其他信号处理干扰
+        os._exit(0)
+    
+    # 处理SIGINT信号（Ctrl+C），确保能够中断
+    def sigint_handler(signum, frame):
+        """处理SIGINT信号（Ctrl+C）"""
+        print(f"\n[SIGINT] Received interrupt signal (Ctrl+C)")
+        safe_save_checkpoint()
+        print("[SIGINT] Exiting...")
+        # 使用os._exit强制退出
+        os._exit(0)
 
     signal.signal(signal.SIGUSR1, melk)
     signal.signal(signal.SIGUSR2, divein)
+    signal.signal(signal.SIGTERM, sigterm_handler)  # 处理kill命令
+    signal.signal(signal.SIGINT, sigint_handler)    # 处理Ctrl+C
 
     # run
     if opt.train:
         try:
+            print(f"[TRAINING] Starting training with {trainer.max_epochs} epochs...")
+            print(f"[TRAINING] Current callbacks: {[type(cb).__name__ for cb in trainer.callbacks]}")
+            print(f"[TRAINING] DDP enabled: {trainer.strategy if hasattr(trainer, 'strategy') else 'N/A'}")
+            
             trainer.fit(model, data)
+            
+            print(f"[TRAINING] Training completed successfully!")
+        except KeyboardInterrupt:
+            # ⭐ 专门处理 Ctrl+C（备用，如果信号处理失败）
+            print("\n[KeyboardInterrupt] Training interrupted by user (Ctrl+C)")
+            try:
+                if trainer.global_rank == 0:
+                    melk()  # 保存checkpoint
+                print("Checkpoint saved. Exiting...")
+            except Exception as e:
+                print(f"Error saving checkpoint: {e}")
+            sys.exit(0)
         except Exception:
-            melk()
+            # 其他异常也保存
+            try:
+                if trainer.global_rank == 0:
+                    melk()
+            except:
+                pass
             raise
     if not opt.no_test and not trainer.interrupted:
         trainer.test(model, data)
