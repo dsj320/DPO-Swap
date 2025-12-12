@@ -667,28 +667,46 @@ if __name__ == "__main__":
 
     # 与 main.py 保持一致：只要提供了 gpus/devices 就启用 GPU；否则退回 CPU
     if "gpus" in trainer_config or "devices" in trainer_config:
-        # 将旧的 gpus 配置映射到 devices，避免 PL 对缺少 gpus 的报错
-        if "devices" not in trainer_config and "gpus" in trainer_config:
+        # PyTorch Lightning 1.4.2 使用 gpus 而不是 devices
+        # 确保使用正确的参数名称
+        num_gpus = None
+        if "gpus" in trainer_config:
             g = trainer_config["gpus"]
             if isinstance(g, str):
                 gpu_ids = [x for x in g.replace(" ", "").split(",") if x != ""]
-                devices = len(gpu_ids) if gpu_ids else 1
+                num_gpus = len(gpu_ids) if gpu_ids else 1
             elif isinstance(g, int):
-                devices = g if g > 0 else 1
+                num_gpus = g if g > 0 else 1
             else:
-                devices = 1
-            trainer_config["devices"] = devices
-        trainer_config["accelerator"] = "gpu"
-        # 多卡时默认 ddp；单卡则不强制 strategy
-        if trainer_config.get("devices", 1) and trainer_config["devices"] > 1:
-            trainer_config.setdefault("strategy", "ddp")
+                num_gpus = 1
+        elif "devices" in trainer_config:
+            # 如果配置中使用了 devices，将其转换为 gpus（PL 1.4.2兼容）
+            num_gpus = trainer_config["devices"]
+            trainer_config["gpus"] = num_gpus
+            # 删除 devices 参数，因为 PL 1.4.2 不支持
+            del trainer_config["devices"]
+        
+        # PL 1.4.2 不需要显式设置 accelerator='gpu'，有 gpus 参数就够了
+        # 如果显式设置 accelerator，可能会导致冲突
+        if "accelerator" in trainer_config:
+            del trainer_config["accelerator"]
+        
+        # 多卡时默认 ddp；单卡则不强制 distributed_backend
+        # pytorch-lightning 1.4.2 使用 distributed_backend 而不是 strategy
+        if num_gpus and num_gpus > 1:
+            trainer_config.setdefault("distributed_backend", "ddp")
         cpu = False
-        print(f"Using accelerator=gpu, devices={trainer_config['devices']}")
+        print(f"Using GPU training with gpus={trainer_config.get('gpus', num_gpus)}")
     else:
         trainer_config.pop("accelerator", None)
+        trainer_config.pop("devices", None)
         cpu = True
         print("Running on CPU")
 
+    # 从 trainer_config 中提取 distributed_backend，避免传递给 Trainer.from_argparse_args
+    # pytorch-lightning 1.4.2 中 distributed_backend 应该通过 kwargs 传递，而不是 argparse
+    distributed_backend_value = trainer_config.pop("distributed_backend", None)
+    
     trainer_opt = argparse.Namespace(**trainer_config)
     lightning_config.trainer = trainer_config
     
@@ -1003,13 +1021,18 @@ if __name__ == "__main__":
 
     trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
 
-    # 使用新的 devices API，避免 gpus 缺失导致的 Misconfiguration
-    if "devices" not in trainer_kwargs and "devices" in trainer_config:
-        trainer_kwargs["devices"] = trainer_config["devices"]
-    if "accelerator" not in trainer_kwargs and "accelerator" in trainer_config:
-        trainer_kwargs["accelerator"] = trainer_config["accelerator"]
-    if trainer_config.get("devices", 1) > 1 and "strategy" in trainer_config:
-        trainer_kwargs.setdefault("strategy", trainer_config["strategy"])
+    # PyTorch Lightning 1.4.2 使用 gpus 而不是 devices，不需要显式传递 accelerator
+    # gpus 参数已经在 trainer_config 中，会通过 trainer_opt 传递
+    # 确保不传递 PL 1.4.2 不支持的参数
+    if "devices" in trainer_kwargs:
+        del trainer_kwargs["devices"]
+    if "accelerator" in trainer_kwargs:
+        del trainer_kwargs["accelerator"]
+    
+    # pytorch-lightning 1.4.2 使用 distributed_backend 而不是 strategy
+    # 通过 kwargs 传递 distributed_backend，而不是通过 argparse
+    if distributed_backend_value is not None:
+        trainer_kwargs["distributed_backend"] = distributed_backend_value
 
     trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
     # trainer.plugins = [MyCluster()]
@@ -1150,7 +1173,9 @@ if __name__ == "__main__":
         try:
             print(f"[TRAINING] Starting training with {trainer.max_epochs} epochs...")
             print(f"[TRAINING] Current callbacks: {[type(cb).__name__ for cb in trainer.callbacks]}")
-            print(f"[TRAINING] DDP enabled: {trainer.strategy if hasattr(trainer, 'strategy') else 'N/A'}")
+            # pytorch-lightning 1.4.2 使用 distributed_backend 而不是 strategy
+            ddp_info = getattr(trainer, 'distributed_backend', None) or getattr(trainer, 'strategy', 'N/A')
+            print(f"[TRAINING] DDP enabled: {ddp_info}")
             
             trainer.fit(model, data)
             

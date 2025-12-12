@@ -17,7 +17,7 @@ model:
     u_cond_percent: 0.2
     scale_factor: 0.18215
     use_ema: True
-    ref_ckpt_path: /data5/shuangjun.du/work/REFace/last.ckpt
+    ref_ckpt_path: ./last.ckpt
     dpo_beta: 5000  # DPO 超参数，控制奖励函数的强度
     use_sft_loss: False  # ⭐ 训练模式：True=SFT有监督微调，False=DPO偏好优化（默认）
     
@@ -30,11 +30,11 @@ model:
     test_dataset_name: "FFHQ"     # 数据集名称: CelebA, FFHQ, FF++
     
     # 测试数据路径
-    test_source_path: "/data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/Val"
-    test_target_path: "/data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/Val_target"
-    test_source_mask_path: "/data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/src_mask"
-    test_target_mask_path: "/data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/target_mask"
-    test_dataset_path: "/data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/images512"  # 用于FID
+    test_source_path: "./dataset/FaceData/FFHQ/Val"
+    test_target_path: "./dataset/FaceData/FFHQ/Val_target"
+    test_source_mask_path: "./dataset/FaceData/FFHQ/src_mask"
+    test_target_mask_path: "./dataset/FaceData/FFHQ/target_mask"
+    test_dataset_path: "./dataset/FaceData/FFHQ/images512"  # 用于FID
     ####
 
 
@@ -128,7 +128,7 @@ data:
       train:
           target: ldm.data.dpo_dataset.DPOFaceDataset
           params:
-              data_manifest_path: /data5/shuangjun.du/work/data_filter/dpo_data_filtered.json
+              data_manifest_path: ./dataset/dpo_data_filtered.json
               args:
                   state: train
                   arbitrary_mask_percent: 0.5
@@ -166,6 +166,5 @@ lightning:
   trainer:
     max_epochs: 20
     num_nodes: 1
-    accelerator: 'gpu'
-    gpus: "0" #可见的gpu中选择哪些
+    gpus: "0" #可见的gpu中选择哪些（PL 1.4.2 使用 gpus 而不是 accelerator+devices）
   
