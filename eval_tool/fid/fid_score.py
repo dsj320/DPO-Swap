@@ -9,7 +9,7 @@ import torchvision.transforms as TF
 from PIL import Image
 from scipy import linalg
 from torch.nn.functional import adaptive_avg_pool2d
-import clip
+
 try:
     from tqdm import tqdm
 except ImportError:
@@ -17,7 +17,10 @@ except ImportError:
     def tqdm(x):
         return x
 
-from inception import InceptionV3
+try:
+    from .inception import InceptionV3
+except ImportError:
+    from inception import InceptionV3
 
 parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
 parser.add_argument('--batch-size', type=int, default=50,
@@ -53,17 +56,21 @@ IMAGE_EXTENSIONS = {'bmp', 'jpg', 'jpeg', 'pgm', 'png', 'ppm',
 class ImagePathDataset(torch.utils.data.Dataset):
     def __init__(self, files, transforms=None):
         self.files = files
-        self.transforms = transforms
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        _, self.preprocess = clip.load("ViT-B/32", device=device)
+        # ⭐ 标准pytorch-fid做法：只ToTensor到[0,1]，让InceptionV3自己归一化
+        # InceptionV3会在forward中执行: x = 2 * x - 1 (归一化到[-1,1])
+        if transforms is None:
+            self.transforms = TF.ToTensor()
+        else:
+            self.transforms = transforms
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, i):
         path = self.files[i]
-        image = self.preprocess(Image.open(path)).unsqueeze(0)
-        return image
+        img = Image.open(path).convert('RGB')
+        img = self.transforms(img)
+        return img
 
 
 def get_activations(files, model, batch_size=50, dims=2048, device='cpu',
@@ -92,14 +99,16 @@ def get_activations(files, model, batch_size=50, dims=2048, device='cpu',
                'Setting batch size to data size'))
         batch_size = len(files)
 
-    dataset = ImagePathDataset(files, transforms=TF.ToTensor())
+    # 使用默认的InceptionV3预处理（在ImagePathDataset中定义）
+    dataset = ImagePathDataset(files, transforms=None)
     dataloader = torch.utils.data.DataLoader(dataset,
                                              batch_size=batch_size,
                                              shuffle=False,
                                              drop_last=False,
                                              num_workers=num_workers)
 
-    pred_arr = np.empty((len(files), 512))
+    # ⭐ 修复：使用正确的维度（dims参数）
+    pred_arr = np.empty((len(files), dims))
 
     start_idx = 0
 
@@ -115,6 +124,10 @@ def get_activations(files, model, batch_size=50, dims=2048, device='cpu',
             pred = adaptive_avg_pool2d(pred, output_size=(1, 1))
 
         pred = pred.squeeze(3).squeeze(2).cpu().numpy()
+
+        # 验证维度匹配
+        if pred.shape[1] != dims:
+            raise ValueError(f"Feature dimension mismatch: expected {dims}, got {pred.shape[1]}")
 
         pred_arr[start_idx:start_idx + pred.shape[0]] = pred
 
@@ -410,14 +423,16 @@ CUDA_VISIBLE_DEVICES=3
 python /data5/shuangjun.du/work/REFace/eval_tool/fid/fid_score.py \
     /data5/shuangjun.du/work/REFace/dataset/FaceData/CelebAMask-HQ/CelebA-HQ-img \
     /data5/shuangjun.du/work/REFace/results/CelebA/REFace/results \
-    --max-samples 200 \
-    --output tmp/fid_score_celeba_200.txt
+    --max-samples 1000 \
+    --save-stats \
+    --output tmp/fid_score_celeba_1000.txt
 
 
 CUDA_VISIBLE_DEVICES=3
 python /data5/shuangjun.du/work/REFace/eval_tool/fid/fid_score.py \
     /data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/images512 \
     /data5/shuangjun.du/work/REFace/results/FFHQ/REFace/results\
-    --max-samples 200 \
-    --output tmp/fid_score_ffhq_200.txt 
+    --max-samples 1000 \
+    --save-stats \
+    --output tmp/fid_score_ffhq_1000.txt 
 """

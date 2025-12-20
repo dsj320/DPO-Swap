@@ -749,7 +749,7 @@ class DPOFaceDataset(data.Dataset):
     def __len__(self):
         return len(self.data_list)
 
-    def _build_inpaint_from_mask(self, mask_pil):
+    def _build_inpaint_from_mask(self, mask_pil, return_before_augment=False):
         # (此函数不变, 它正确地处理 Target Mask)
         mask_np = np.array(mask_pil)
         keep = np.isin(mask_np, self.preserve)
@@ -759,8 +759,16 @@ class DPOFaceDataset(data.Dataset):
         mask_keep_tensor = self.to_mask(mask_keep_pil) 
         inpaint_mask = 1.0 - mask_keep_tensor
         inpaint_mask = self.resize_mask(inpaint_mask)
+        
+        # 保存增强前的 mask
+        inpaint_mask_before = inpaint_mask.clone()
+        
+        # 应用 TPS 形变增强
         scale = random.uniform(0.5, 1.0)
         inpaint_mask = decow(inpaint_mask.unsqueeze(0), scale=scale).squeeze(0)
+        
+        if return_before_augment:
+            return inpaint_mask, inpaint_mask_before
         return inpaint_mask
 
     def __getitem__(self, idx):
@@ -805,17 +813,31 @@ class DPOFaceDataset(data.Dataset):
         
         # -----------------------------------------------------------------
         # 3. 处理 inpaint_mask (第一次随机调用, 顺序正确)
+        #    同时获取增强前后的两个 mask 用于对比可视化
         # -----------------------------------------------------------------
-        inpaint_mask = self._build_inpaint_from_mask(tgt_mask_pil) 
+        inpaint_mask_augmented, inpaint_mask_before_augment = self._build_inpaint_from_mask(tgt_mask_pil, return_before_augment=True) 
+        
+        # ⚠️ 关键决策：有监督 inpainting 应该使用增强前的 mask
+        # 原因：GT_w 和 GT_l 是在增强前的 mask 条件下生成的
+        # 如果使用增强后的 mask，监督信号会不匹配
+        # 
+        # 自监督 (CelebAdataset)：可以用增强后的，因为 GT 和 input 来自同一张图
+        # 有监督 (DPOFaceDataset)：必须用增强前的，因为 GT 是独立图像
+        inpaint_mask = inpaint_mask_before_augment  # ⭐ 使用增强前的 mask
         
         # -----------------------------------------------------------------
         # 4. [关键修复] 创建 inpaint_image
-        #    匹配原始 CelebAdataset 的 "GT * Mask" 逻辑
+        #    使用增强前的 mask，确保与 GT 的监督信号匹配
         # -----------------------------------------------------------------
-        inpaint_image = base_img * inpaint_mask  # <-- 修复了这一行
+        inpaint_image = base_img * inpaint_mask
         
         # -----------------------------------------------------------------
         # 5. 处理 ref_imgs (第二次随机调用, 顺序和逻辑均正确)
+        #    ⭐ 设计决策：只保留核心人脸区域
+        #    - preserve_mask_src 建议：[1,2,4,5,6,7,10,11,12]
+        #    - 包含：skin, nose, eyes, brows, mouth, lips
+        #    - 排除：ears(8,9), neck(17) - 减少非面部特征的干扰
+        #    - 不做数据增强 - 保持条件编码的稳定性
         # -----------------------------------------------------------------
         
         # A. (使用 ref_mask_pil) 创建二值 mask (0/255 numpy)
@@ -853,18 +875,146 @@ class DPOFaceDataset(data.Dataset):
         
         # -----------------------------------------------------------------
 
-        # 最终输出
-        # 注意：GT 必须始终存在，因为 get_input 函数会使用它
+        # =================================================================
+        # 最终输出：10个字段的详细说明
+        # =================================================================
         out = {
-            "GT_w":          GT_w,            
-            "GT_l":          GT_l,
-            "GT":            base_img,        # 总是添加 GT（base_img 已经是 resized 的）
-            "inpaint_image": inpaint_image,   
-            "inpaint_mask":  inpaint_mask,    
-            "ref_imgs":      ref_imgs,        
-            # 新增：未经mask处理的B和D图像（用于SFT训练）
-            "ref_img_raw":   ref_img_raw,    # B图像（Source，未mask）
-            "tgt_img_raw":   tgt_img_raw,    # D图像（Target，未mask）
+            # ─────────────────────────────────────────────────────────────
+            # 1. GT_w (Ground Truth Winner - DPO正样本)
+            # ─────────────────────────────────────────────────────────────
+            "GT_w": GT_w,
+            # 来源: path_A_chosen (A图像)
+            # 内容: 好的修复结果（换脸后的正确结果）
+            # 形状: (3, 512, 512)
+            # 归一化: 标准归一化 [-1, 1], mean=(0.5,0.5,0.5), std=(0.5,0.5,0.5)
+            # mask状态: 未mask（完整图像）
+            # 训练作用: DPO的winner，模型应该学习输出类似的结果
+            # 使用位置: p_loss_sft/p_losses_dpo 中作为训练目标加噪
+            
+            # ─────────────────────────────────────────────────────────────
+            # 2. GT_l (Ground Truth Loser - DPO负样本)
+            # ─────────────────────────────────────────────────────────────
+            "GT_l": GT_l,
+            # 来源: path_E_rejected (E图像)
+            # 内容: 差的修复结果（换脸效果不好）
+            # 形状: (3, 512, 512)
+            # 归一化: 标准归一化 [-1, 1]
+            # mask状态: 未mask（完整图像）
+            # 训练作用: DPO的loser，模型应该避免输出类似的结果
+            # 使用位置: p_losses_dpo 中作为负样本加噪
+            
+            # ─────────────────────────────────────────────────────────────
+            # 3. GT (Ground Truth / Base Image)
+            # ─────────────────────────────────────────────────────────────
+            "GT": base_img,
+            # 来源: path_D_target (D图像) 或 path_A_chosen (A图像)
+            # 内容: 目标图像（提供姿态和背景）
+            # 形状: (3, 512, 512)
+            # 归一化: 标准归一化 [-1, 1]
+            # mask状态: 未mask（完整图像）
+            # 训练作用: 提供背景和上下文，get_input函数需要
+            # 使用位置: get_input 中获取 landmarks
+            
+            # ─────────────────────────────────────────────────────────────
+            # 4. GT_nomask (与GT相同，命名更明确)
+            # ─────────────────────────────────────────────────────────────
+            "GT_nomask": base_img,
+            # 来源: 与 GT 相同
+            # 内容: 完整的目标图像（未经mask处理）
+            # 形状: (3, 512, 512)
+            # 归一化: 标准归一化 [-1, 1]
+            # mask状态: 未mask（完整图像）
+            # 训练作用: 提供完整参考，命名语义更清晰
+            
+            # ─────────────────────────────────────────────────────────────
+            # 5. inpaint_image (模型的主要输入)
+            # ─────────────────────────────────────────────────────────────
+            "inpaint_image": inpaint_image,
+            # 来源: base_img * inpaint_mask
+            # 内容: D图像被mask遮罩后的结果（脸部被遮罩变黑，背景保留）
+            # 形状: (3, 512, 512)
+            # 归一化: 标准归一化 [-1, 1]
+            # mask状态: 已mask（脸部区域值为0，背景区域保留原值）
+            # 具体: inpaint_mask中 1.0的地方保留原图，0.0的地方变为0（黑色）
+            # 训练作用: 送入VAE编码为z_inpaint，作为条件信息告诉模型背景
+            # 使用位置: get_input 中编码为 z_inpaint，拼接到9通道输入中
+            
+            # ─────────────────────────────────────────────────────────────
+            # 6. inpaint_mask (遮罩 - 增强前，实际使用) ⭐ 关键
+            # ─────────────────────────────────────────────────────────────
+            "inpaint_mask": inpaint_mask,
+            # 来源: _build_inpaint_from_mask(增强前版本)
+            # 内容: 二值mask（规则边界，未经TPS形变）
+            # 形状: (1, 512, 512)
+            # 数值范围: [0.0, 1.0]
+            # mask语义: 1.0 = 保留区域（背景），0.0 = 遮罩区域（需要修复的脸部）
+            # 训练作用: 
+            #   1. 生成 inpaint_image = base_img * mask
+            #   2. 作为第9通道送入模型，告诉模型哪里需要修复
+            #   3. 在ID损失中，反转后(1-mask)用于提取脸部区域
+            # 使用位置: 
+            #   - get_input: resize后作为第9通道
+            #   - ID loss: mask = 1 - inpaint_mask，提取脸部区域
+            # 为什么用增强前: GT_w/GT_l是在增强前mask下生成的，必须匹配
+            
+            # ─────────────────────────────────────────────────────────────
+            # 7. inpaint_mask_augmented (增强后的mask - 仅用于调试)
+            # ─────────────────────────────────────────────────────────────
+            "inpaint_mask_augmented": inpaint_mask_augmented,
+            # 来源: _build_inpaint_from_mask(增强后版本，经过TPS形变)
+            # 内容: 二值mask（不规则边界，经过TPS形变）
+            # 形状: (1, 512, 512)
+            # 数值范围: [0.0, 1.0]
+            # mask语义: 与inpaint_mask相同
+            # 训练作用: ❌ 不用于训练！仅用于对比/调试
+            # 为什么不用: 会导致监督信号不匹配（GT在增强前mask下生成）
+            
+            # ─────────────────────────────────────────────────────────────
+            # 8. ref_imgs (参考图像 - 带mask，用于条件编码) ⭐ 关键
+            # ─────────────────────────────────────────────────────────────
+            "ref_imgs": ref_imgs,
+            # 来源: B源图像经过复杂的mask+归一化处理
+            # 内容: B图像只保留核心人脸区域（skin,nose,eyes,brows,mouth,lips）
+            #       非核心区域（ears,neck）被mask掉（值为0）
+            # 形状: (3, 224, 224)
+            # 归一化: CLIP归一化, mean=(0.48,0.46,0.41), std=(0.27,0.26,0.28)
+            # 数值范围: 典型 [-2.0, 2.0]
+            # mask状态: 已mask（只保留核心人脸，非核心区域为0）
+            # 处理流程: 
+            #   B原图 → CLIP norm → 应用mask(只保留核心脸) → unnorm 
+            #   → resize(224×224) → CLIP norm → ref_imgs
+            # 训练作用: 送入CLIP编码器提取身份特征，作为条件指导生成
+            # 使用位置: get_input 中作为 reference，送入 conditioning_with_feat
+            # 设计理由: 
+            #   - 只保留核心人脸: 减少耳朵、脖子等非核心区域的干扰
+            #   - 不做数据增强: 保持条件编码的稳定性
+            
+            # ─────────────────────────────────────────────────────────────
+            # 9. ref_img_raw (参考图像 - 未mask，用于ID损失)
+            # ─────────────────────────────────────────────────────────────
+            "ref_img_raw": ref_img_raw,
+            # 来源: B源图像直接resize和归一化
+            # 内容: B的完整图像（包括所有区域：人脸+耳朵+脖子+背景）
+            # 形状: (3, 224, 224)
+            # 归一化: CLIP归一化
+            # 数值范围: 典型 [-2.0, 2.0]
+            # mask状态: 未mask（完整图像）
+            # 处理流程: B原图 → resize(224×224) → CLIP norm → ref_img_raw
+            # 训练作用: 在ID损失中作为source图像，需要完整的面部信息
+            # 使用位置: p_loss_sft/p_losses_dpo 中计算ID损失时使用
+            # 为什么需要完整图像: ID特征提取需要完整的脸部上下文
+            
+            # ─────────────────────────────────────────────────────────────
+            # 10. tgt_img_raw (目标图像 - 未mask)
+            # ─────────────────────────────────────────────────────────────
+            "tgt_img_raw": tgt_img_raw,
+            # 来源: D目标图像
+            # 内容: 完整的D图像（与GT/GT_nomask相同）
+            # 形状: (3, 512, 512)
+            # 归一化: 标准归一化 [-1, 1]
+            # mask状态: 未mask（完整图像）
+            # 训练作用: 提供完整的目标参考，命名更明确
+            # 实际上: tgt_img_raw = GT = GT_nomask = base_img
         }
             
         return out

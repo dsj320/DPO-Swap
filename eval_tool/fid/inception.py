@@ -1,8 +1,11 @@
+"""
+标准的InceptionV3实现，用于FID计算
+来源：pytorch-fid项目 https://github.com/mseitzer/pytorch-fid
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision
-import clip
+
 try:
     from torchvision.models.utils import load_state_dict_from_url
 except ImportError:
@@ -10,7 +13,7 @@ except ImportError:
 
 # Inception weights ported to Pytorch from
 # http://download.tensorflow.org/models/image/imagenet/inception-2015-12-05.tgz
-FID_WEIGHTS_URL = 'https://github.com/mseitzer/pytorch-fid/releases/download/fid_weights/pt_inception-2015-12-05-6726825d.pth'  # noqa: E501
+FID_WEIGHTS_URL = 'https://github.com/mseitzer/pytorch-fid/releases/download/fid_weights/pt_inception-2015-12-05-6726825d.pth'
 
 
 class InceptionV3(nn.Module):
@@ -23,7 +26,7 @@ class InceptionV3(nn.Module):
     # Maps feature dimensionality to their output blocks indices
     BLOCK_INDEX_BY_DIM = {
         64: 0,   # First max pooling features
-        192: 1,  # Second max pooling featurs
+        192: 1,  # Second max pooling features
         768: 2,  # Pre-aux classifier features
         2048: 3  # Final average pooling features
     }
@@ -35,6 +38,7 @@ class InceptionV3(nn.Module):
                  requires_grad=False,
                  use_fid_inception=True):
         """Build pretrained InceptionV3
+        
         Parameters
         ----------
         output_blocks : list of int
@@ -64,7 +68,7 @@ class InceptionV3(nn.Module):
             results.
         """
         super(InceptionV3, self).__init__()
-        self.clip_model, self.preprocess = clip.load("ViT-B/32", device="cuda")
+
         self.resize_input = resize_input
         self.normalize_input = normalize_input
         self.output_blocks = sorted(output_blocks)
@@ -78,7 +82,11 @@ class InceptionV3(nn.Module):
         if use_fid_inception:
             inception = fid_inception_v3()
         else:
-            inception = _inception_v3(pretrained=True)
+            try:
+                inception = _inception_v3(weights='DEFAULT')
+            except TypeError:
+                # older versions of torchvision
+                inception = _inception_v3(pretrained=True)
 
         # Block 0: input to maxpool1
         block0 = [
@@ -127,11 +135,13 @@ class InceptionV3(nn.Module):
 
     def forward(self, inp):
         """Get Inception feature maps
+        
         Parameters
         ----------
         inp : torch.autograd.Variable
             Input tensor of shape Bx3xHxW. Values are expected to be in
             range (0, 1)
+        
         Returns
         -------
         List of torch.autograd.Variable, corresponding to the selected output
@@ -139,57 +149,55 @@ class InceptionV3(nn.Module):
         """
         outp = []
         x = inp
-        # print(x.shape)
-        image_features = self.clip_model.encode_image(x.squeeze(1))
-        # print(image_features.shape)
-        outp=[image_features.unsqueeze(2).unsqueeze(3)]
-        # print(outp[0].shape)
-        # if self.resize_input:
-        #     x = F.interpolate(x,
-        #                       size=(299, 299),
-        #                       mode='bilinear',
-        #                       align_corners=False)
 
-        # if self.normalize_input:
-        #     x = 2 * x - 1  # Scale from range (0, 1) to range (-1, 1)
+        if self.resize_input:
+            x = F.interpolate(x,
+                            size=(299, 299),
+                            mode='bilinear',
+                            align_corners=False)
 
-        # for idx, block in enumerate(self.blocks):
-        #     x = block(x)
-        #     if idx in self.output_blocks:
-        #         outp.append(x)
+        if self.normalize_input:
+            x = 2 * x - 1  # Scale from range (0, 1) to range (-1, 1)
 
-        #     if idx == self.last_needed_block:
-        #         break
+        for idx, block in enumerate(self.blocks):
+            x = block(x)
+            if idx in self.output_blocks:
+                outp.append(x)
+
+            if idx == self.last_needed_block:
+                break
+
         return outp
 
 
 def _inception_v3(*args, **kwargs):
-    """Wraps `torchvision.models.inception_v3`
-    Skips default weight inititialization if supported by torchvision version.
-    See https://github.com/mseitzer/pytorch-fid/issues/28.
-    """
+    """Wraps `torchvision.models.inception_v3`"""
     try:
-        version = tuple(map(int, torchvision.__version__.split('.')[:2]))
+        version = tuple(map(int, torch.__version__.split('.')[:2]))
     except ValueError:
-        # Just a caution against weird version strings
-        version = (0,)
-
-    if version >= (0, 6):
+        # could not parse version
+        version = (2, 0)
+    if version >= (1, 6):
         kwargs['init_weights'] = False
-
-    return torchvision.models.inception_v3(*args, **kwargs)
+    try:
+        from torchvision.models import inception_v3
+    except ImportError:
+        raise ImportError('torchvision.models.inception_v3 not available')
+    return inception_v3(*args, **kwargs)
 
 
 def fid_inception_v3():
     """Build pretrained Inception model for FID computation
+    
     The Inception model for FID computation uses a different set of weights
     and has a slightly different structure than torchvision's Inception.
+    
     This method first constructs torchvision's Inception and then patches the
     necessary parts that are different in the FID Inception model.
     """
     inception = _inception_v3(num_classes=1008,
-                              aux_logits=False,
-                              pretrained=False)
+                             aux_logits=False,
+                             pretrained=False)
     inception.Mixed_5b = FIDInceptionA(192, pool_features=32)
     inception.Mixed_5c = FIDInceptionA(256, pool_features=64)
     inception.Mixed_5d = FIDInceptionA(288, pool_features=64)
@@ -205,10 +213,21 @@ def fid_inception_v3():
     return inception
 
 
-class FIDInceptionA(torchvision.models.inception.InceptionA):
+class FIDInceptionA(nn.Module):
     """InceptionA block patched for FID computation"""
+
     def __init__(self, in_channels, pool_features):
-        super(FIDInceptionA, self).__init__(in_channels, pool_features)
+        super(FIDInceptionA, self).__init__()
+        self.branch1x1 = BasicConv2d(in_channels, 64, kernel_size=1)
+
+        self.branch5x5_1 = BasicConv2d(in_channels, 48, kernel_size=1)
+        self.branch5x5_2 = BasicConv2d(48, 64, kernel_size=5, padding=2)
+
+        self.branch3x3dbl_1 = BasicConv2d(in_channels, 64, kernel_size=1)
+        self.branch3x3dbl_2 = BasicConv2d(64, 96, kernel_size=3, padding=1)
+        self.branch3x3dbl_3 = BasicConv2d(96, 96, kernel_size=3, padding=1)
+
+        self.branch_pool = BasicConv2d(in_channels, pool_features, kernel_size=1)
 
     def forward(self, x):
         branch1x1 = self.branch1x1(x)
@@ -220,20 +239,32 @@ class FIDInceptionA(torchvision.models.inception.InceptionA):
         branch3x3dbl = self.branch3x3dbl_2(branch3x3dbl)
         branch3x3dbl = self.branch3x3dbl_3(branch3x3dbl)
 
-        # Patch: Tensorflow's average pool does not use the padded zero's in
-        # its average calculation
-        branch_pool = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1,
-                                   count_include_pad=False)
+        branch_pool = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
         branch_pool = self.branch_pool(branch_pool)
 
         outputs = [branch1x1, branch5x5, branch3x3dbl, branch_pool]
         return torch.cat(outputs, 1)
 
 
-class FIDInceptionC(torchvision.models.inception.InceptionC):
+class FIDInceptionC(nn.Module):
     """InceptionC block patched for FID computation"""
+
     def __init__(self, in_channels, channels_7x7):
-        super(FIDInceptionC, self).__init__(in_channels, channels_7x7)
+        super(FIDInceptionC, self).__init__()
+        self.branch1x1 = BasicConv2d(in_channels, 192, kernel_size=1)
+
+        c7 = channels_7x7
+        self.branch7x7_1 = BasicConv2d(in_channels, c7, kernel_size=1)
+        self.branch7x7_2 = BasicConv2d(c7, c7, kernel_size=(1, 7), padding=(0, 3))
+        self.branch7x7_3 = BasicConv2d(c7, 192, kernel_size=(7, 1), padding=(3, 0))
+
+        self.branch7x7dbl_1 = BasicConv2d(in_channels, c7, kernel_size=1)
+        self.branch7x7dbl_2 = BasicConv2d(c7, c7, kernel_size=(7, 1), padding=(3, 0))
+        self.branch7x7dbl_3 = BasicConv2d(c7, c7, kernel_size=(1, 7), padding=(0, 3))
+        self.branch7x7dbl_4 = BasicConv2d(c7, c7, kernel_size=(7, 1), padding=(3, 0))
+        self.branch7x7dbl_5 = BasicConv2d(c7, 192, kernel_size=(1, 7), padding=(0, 3))
+
+        self.branch_pool = BasicConv2d(in_channels, 192, kernel_size=1)
 
     def forward(self, x):
         branch1x1 = self.branch1x1(x)
@@ -248,20 +279,30 @@ class FIDInceptionC(torchvision.models.inception.InceptionC):
         branch7x7dbl = self.branch7x7dbl_4(branch7x7dbl)
         branch7x7dbl = self.branch7x7dbl_5(branch7x7dbl)
 
-        # Patch: Tensorflow's average pool does not use the padded zero's in
-        # its average calculation
-        branch_pool = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1,
-                                   count_include_pad=False)
+        branch_pool = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
         branch_pool = self.branch_pool(branch_pool)
 
         outputs = [branch1x1, branch7x7, branch7x7dbl, branch_pool]
         return torch.cat(outputs, 1)
 
 
-class FIDInceptionE_1(torchvision.models.inception.InceptionE):
+class FIDInceptionE_1(nn.Module):
     """First InceptionE block patched for FID computation"""
+
     def __init__(self, in_channels):
-        super(FIDInceptionE_1, self).__init__(in_channels)
+        super(FIDInceptionE_1, self).__init__()
+        self.branch1x1 = BasicConv2d(in_channels, 320, kernel_size=1)
+
+        self.branch3x3_1 = BasicConv2d(in_channels, 384, kernel_size=1)
+        self.branch3x3_2a = BasicConv2d(384, 384, kernel_size=(1, 3), padding=(0, 1))
+        self.branch3x3_2b = BasicConv2d(384, 384, kernel_size=(3, 1), padding=(1, 0))
+
+        self.branch3x3dbl_1 = BasicConv2d(in_channels, 448, kernel_size=1)
+        self.branch3x3dbl_2 = BasicConv2d(448, 384, kernel_size=3, padding=1)
+        self.branch3x3dbl_3a = BasicConv2d(384, 384, kernel_size=(1, 3), padding=(0, 1))
+        self.branch3x3dbl_3b = BasicConv2d(384, 384, kernel_size=(3, 1), padding=(1, 0))
+
+        self.branch_pool = BasicConv2d(in_channels, 192, kernel_size=1)
 
     def forward(self, x):
         branch1x1 = self.branch1x1(x)
@@ -281,20 +322,30 @@ class FIDInceptionE_1(torchvision.models.inception.InceptionE):
         ]
         branch3x3dbl = torch.cat(branch3x3dbl, 1)
 
-        # Patch: Tensorflow's average pool does not use the padded zero's in
-        # its average calculation
-        branch_pool = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1,
-                                   count_include_pad=False)
+        branch_pool = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1)
         branch_pool = self.branch_pool(branch_pool)
 
         outputs = [branch1x1, branch3x3, branch3x3dbl, branch_pool]
         return torch.cat(outputs, 1)
 
 
-class FIDInceptionE_2(torchvision.models.inception.InceptionE):
+class FIDInceptionE_2(nn.Module):
     """Second InceptionE block patched for FID computation"""
+
     def __init__(self, in_channels):
-        super(FIDInceptionE_2, self).__init__(in_channels)
+        super(FIDInceptionE_2, self).__init__()
+        self.branch1x1 = BasicConv2d(in_channels, 320, kernel_size=1)
+
+        self.branch3x3_1 = BasicConv2d(in_channels, 384, kernel_size=1)
+        self.branch3x3_2a = BasicConv2d(384, 384, kernel_size=(1, 3), padding=(0, 1))
+        self.branch3x3_2b = BasicConv2d(384, 384, kernel_size=(3, 1), padding=(1, 0))
+
+        self.branch3x3dbl_1 = BasicConv2d(in_channels, 448, kernel_size=1)
+        self.branch3x3dbl_2 = BasicConv2d(448, 384, kernel_size=3, padding=1)
+        self.branch3x3dbl_3a = BasicConv2d(384, 384, kernel_size=(1, 3), padding=(0, 1))
+        self.branch3x3dbl_3b = BasicConv2d(384, 384, kernel_size=(3, 1), padding=(1, 0))
+
+        self.branch_pool = BasicConv2d(in_channels, 192, kernel_size=1)
 
     def forward(self, x):
         branch1x1 = self.branch1x1(x)
@@ -314,12 +365,22 @@ class FIDInceptionE_2(torchvision.models.inception.InceptionE):
         ]
         branch3x3dbl = torch.cat(branch3x3dbl, 1)
 
-        # Patch: The FID Inception model uses max pooling instead of average
-        # pooling. This is likely an error in this specific Inception
-        # implementation, as other Inception models use average pooling here
-        # (which matches the description in the paper).
         branch_pool = F.max_pool2d(x, kernel_size=3, stride=1, padding=1)
         branch_pool = self.branch_pool(branch_pool)
 
         outputs = [branch1x1, branch3x3, branch3x3dbl, branch_pool]
         return torch.cat(outputs, 1)
+
+
+class BasicConv2d(nn.Module):
+    """Basic 2D convolution with BatchNorm and ReLU"""
+
+    def __init__(self, in_channels, out_channels, **kwargs):
+        super(BasicConv2d, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, bias=False, **kwargs)
+        self.bn = nn.BatchNorm2d(out_channels, eps=0.001)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        return F.relu(x, inplace=True)

@@ -506,10 +506,16 @@ class DDPM(pl.LightningModule):
             self.model_ema(self.model)
         
         # 在特定step进行测试
+        # ⭐ 修复：使用标志位避免梯度累积时重复触发测试
         if (hasattr(self, 'test_during_training') and self.test_during_training and 
             hasattr(self, 'test_interval_steps') and 
             self.global_step > 0 and self.global_step % self.test_interval_steps == 0):
-            self.run_test_during_training()
+            # 检查是否已经在当前step测试过
+            last_test_step = getattr(self, '_last_test_step', -1)
+            if self.global_step != last_test_step:
+                self._last_test_step = self.global_step
+                self.run_test_during_training()
+    
 
     def _get_rows_from_list(self, samples):
         n_imgs_per_row = len(samples)
@@ -600,8 +606,16 @@ class LatentDiffusion(DDPM):
         aux_diffusion_weight = kwargs.pop('aux_diffusion_weight', 1.0)
         aux_id_loss_weight = kwargs.pop('aux_id_loss_weight', 0.3)
         aux_lpips_loss_weight = kwargs.pop('aux_lpips_loss_weight', 0.1)
+        aux_lpips_multiscale = kwargs.pop('aux_lpips_multiscale', True)  # ⭐ 新增：LPIPS多尺度
+        aux_reconstruct_weight = kwargs.pop('aux_reconstruct_weight', 1.0)  # ⭐ 新增：L2重构损失权重
         aux_reconstruct_ddim_steps = kwargs.pop('aux_reconstruct_ddim_steps', 4)
         dpo_loss_weight = kwargs.pop('dpo_loss_weight', 1.0)
+        use_timestep_weighting = kwargs.pop('use_timestep_weighting', True)  # ⭐ 新增：时间步权重
+        timestep_weight_scale = kwargs.pop('timestep_weight_scale', 1.0)  # ⭐ 新增：权重缩放因子
+        
+        # ⭐ 可视化配置
+        visualize_denoise_process = kwargs.pop('visualize_denoise_process', False)  # 是否可视化去噪过程
+        visualize_interval_steps = kwargs.pop('visualize_interval_steps', 500)  # 每N步可视化一次
         
         # 训练时测试的配置（需要在调用父类之前移除，避免传递给父类）
         test_during_training = kwargs.pop('test_during_training', False)  # 是否在训练时进行测试
@@ -632,7 +646,6 @@ class LatentDiffusion(DDPM):
         self.test_batch_size = test_batch_size
         self.test_guidance_scale = test_guidance_scale
         self.test_ddim_steps = test_ddim_steps
-        self.test_guidance_scale = test_guidance_scale
 
         #---------------------DPO---------------------------------
         
@@ -673,19 +686,38 @@ class LatentDiffusion(DDPM):
         self.aux_diffusion_weight = aux_diffusion_weight
         self.aux_id_loss_weight = aux_id_loss_weight
         self.aux_lpips_loss_weight = aux_lpips_loss_weight
+        self.aux_lpips_multiscale = aux_lpips_multiscale  # ⭐ 新增：LPIPS多尺度
+        self.aux_reconstruct_weight = aux_reconstruct_weight  # ⭐ 新增：L2重构损失权重
         self.aux_reconstruct_ddim_steps = aux_reconstruct_ddim_steps
         self.dpo_loss_weight = dpo_loss_weight
+        self.use_timestep_weighting = use_timestep_weighting  # ⭐ 新增：时间步权重
+        self.timestep_weight_scale = timestep_weight_scale  # ⭐ 新增：权重缩放因子
+        
+        # ⭐ 可视化配置
+        self.visualize_denoise_process = visualize_denoise_process
+        self.visualize_interval_steps = visualize_interval_steps
+        
         
         print(f"训练模式配置:")
         print(f"  - 使用 SFT Loss: {self.use_sft_loss} {'(有监督微调)' if self.use_sft_loss else '(DPO偏好优化)'}")
         print(f"  - DPO β参数: {self.dpo_beta}")
         print(f"  - DPO 损失权重: {self.dpo_loss_weight}")
         print(f"  - 是否启用辅助损失: {self.use_auxiliary_losses}")
-        if self.use_auxiliary_losses:
+        if self.use_auxiliary_losses or self.use_sft_loss:
             print(f"  - 扩散损失权重: {self.aux_diffusion_weight}")
             print(f"  - ID 损失权重: {self.aux_id_loss_weight}")
-            print(f"  - 感知损失权重: {self.aux_lpips_loss_weight}")
+            print(f"  - L2 重构损失权重: {self.aux_reconstruct_weight}")
+            print(f"  - LPIPS 感知损失权重: {self.aux_lpips_loss_weight}")
+            if self.aux_lpips_loss_weight > 0:
+                print(f"  - ⭐ LPIPS 多尺度: {self.aux_lpips_multiscale} {'(参考DPO: 512/256/128)' if self.aux_lpips_multiscale else '(单尺度)'}")
             print(f"  - DDIM 重构步数: {self.aux_reconstruct_ddim_steps}")
+        print(f"  - ⭐ 可视化去噪过程: {self.visualize_denoise_process}")
+        if self.visualize_denoise_process:
+            print(f"  - 可视化间隔: 每 {self.visualize_interval_steps} 步")
+            if self.use_sft_loss:
+                print(f"  - ⭐ 使用时间步权重: {self.use_timestep_weighting}")
+                if self.use_timestep_weighting:
+                    print(f"  - ⭐ 时间步权重缩放: {self.timestep_weight_scale}")
      
         self.concat_mode = concat_mode
         self.cond_stage_trainable = cond_stage_trainable
@@ -1294,6 +1326,8 @@ class LatentDiffusion(DDPM):
             x_w, x_l = x_w[:bs], x_l[:bs]
             GT_original = GT_original[:bs]
             inpaint, mask, reference = inpaint[:bs], mask[:bs], reference[:bs]
+            if ref_raw is not None:
+                ref_raw = ref_raw[:bs]  # ⭐ 修复：同时截断 ref_raw
         
         # 2. 编码共享条件
         z_inpaint = self.get_first_stage_encoding(self.encode_first_stage(inpaint)).detach()
@@ -1313,9 +1347,11 @@ class LatentDiffusion(DDPM):
             landmarks = None
         
         if self.model.conditioning_key is not None:
-            # ⭐ 优先使用未mask的 ref_raw 作为条件（信息更完整）
-            # 如果 ref_raw 不存在，则回退到 reference (masked版本)
-            xc = ref_raw if ref_raw is not None else reference
+            # ⭐ 修复：应该使用带mask的 reference（ref_imgs）作为条件
+            # 原因：只保留核心人脸区域，特征更纯净，减少干扰
+            # reference: B图像（带mask，只保留核心人脸）
+            # ref_raw: B图像（未mask，完整图像）- 仅用于ID损失
+            xc = reference  # ← 修复：使用带mask的版本
             if not self.cond_stage_trainable or force_c_encode:
                 c_shared = self.conditioning_with_feat(xc, landmarks=landmarks).float()
             else:
@@ -1518,6 +1554,13 @@ class LatentDiffusion(DDPM):
         x, c ,landmarks= self.get_input(batch, self.first_stage_key,get_landmarks_out=True)
         loss = self(x, c,landmarks=landmarks)
         return loss
+    # ========== 已禁用：可视化函数 ==========
+    # def _visualize_denoise_intermediates(self, sample_intermediates, gt_image, ref_image, prefix='train/denoise_process'):
+    #     """
+    #     可视化DDIM多步去噪的中间过程（已禁用以提升训练速度）
+    #     """
+    #     pass
+    
     def shared_step_face(self, batch, **kwargs):
         # ⭐ 解包：z_w, z_l, c 都是 [B, ...]
        # 修改后：添加 force_c_encode=True 和 get_ref_raw=True
@@ -1777,7 +1820,7 @@ class LatentDiffusion(DDPM):
     def p_loss_sft(self, z_start_w, z_start_l, cond, t, reference=None, ref_raw=None, GT_w=None, landmarks=None):
         """
         SFT损失函数 - 参考论文公式
-        L = λ_id * L_id + λ_DM * L_DM + λ_rec * L_rec
+        L = λ_id * L_id + λ_DM * L_DM + λ_rec * L_rec + λ_lpips * L_lpips
         
         参数说明（换脸任务）:
         z_start_w: GT潜变量 (B, 9, 64, 64) - [z0_A, z_inp, m]
@@ -1796,9 +1839,23 @@ class LatentDiffusion(DDPM):
         - B = Source（提供身份）
         - D = Target（提供姿态）
         - 目标：学习 (D + B的条件) → A 的映射
+        
+        ⭐ 新增时间步权重机制：
+        - 当t很小时，预测的x0更准确，给予较大权重
+        - 当t很大时，预测的x0噪声较多，给予较小权重
+        - weight(t) = (1000 - t) / 1000 * scale
         """
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
+        
+        # ========== 0️⃣ 计算时间步权重 (与t成反比) ==========
+        if self.use_timestep_weighting:
+            # weight(t) = (T - t) / T * scale，t越小权重越大
+            # t=0时权重=1.0*scale，t=999时权重≈0
+            timestep_weight = ((self.num_timesteps - t.float()) / self.num_timesteps * self.timestep_weight_scale).mean()
+            loss_dict[f'{prefix}/timestep_weight'] = timestep_weight
+        else:
+            timestep_weight = 1.0
         
         # ========== 1️⃣ Diffusion Loss (L_DM) - 主要损失 ==========
         # 论文: L_DM = E[||ε - ε_θ(z_t, c, t)||_2]
@@ -1823,25 +1880,86 @@ class LatentDiffusion(DDPM):
         # 主损失（根据配置的权重）
         loss_total = self.aux_diffusion_weight * loss_DM
         
-        # ========== 2️⃣ ID Loss (L_id) + Reconstruction Loss (L_rec) ==========
+        # 采样一个新的 t_new（固定为最大时间步，用于重建损失计算）
+        # 从最大噪声状态开始去噪，测试完整的去噪能力
+        t_new = torch.randint(
+            self.num_timesteps - 1, 
+            self.num_timesteps, 
+            (z_start_w.shape[0],), 
+            device=self.device
+        ).long()
+        
+        # 使用 t_new 重新加噪（从最大噪声开始）
+        z_t_new = self.q_sample(x_start=z0_A, t=t_new, noise=noise)
+        
+        # ========== 2️⃣ ID Loss (L_id) + Reconstruction Loss (L_rec) + LPIPS Loss ==========
         # 论文: 使用one-step property进行推理，避免多步DDIM采样
         
-        if (self.aux_id_loss_weight > 0 or self.aux_lpips_loss_weight > 0):
-            # 使用单步预测x0（基于DDPM公式）
-            # x0 = (z_t - sqrt(1-α_t) * ε) / sqrt(α_t)
-            pred_x0 = self.predict_start_from_noise(z_t, t, pred_noise)
+        if (self.aux_id_loss_weight > 0 or self.aux_lpips_loss_weight > 0 or self.aux_reconstruct_weight > 0):
+            # ⭐ 根据配置选择单步预测或多步去噪
+            ddim_steps = self.aux_reconstruct_ddim_steps
             
-            # 解码到像素空间（只解码一次，高效！）
-            x_pred = self.differentiable_decode_first_stage(pred_x0)
+            if ddim_steps == 1:
+                # 使用单步预测x0（基于DDPM公式）
+                # x0 = (z_t - sqrt(1-α_t) * ε) / sqrt(α_t)
+                pred_x0 = self.predict_start_from_noise(z_t, t, pred_noise)
+                
+                # 解码到像素空间（只解码一次，高效！）
+                x_pred = self.differentiable_decode_first_stage(pred_x0)
+            else:
+                # 使用多步DDIM去噪获取x0
+                # Step 1: 准备输入（使用 z_t_new，从最大时间步开始去噪）
+                z_noisy_rec = torch.cat((z_t_new, z_start_w[:, 4:, :, :]), dim=1)
+                
+                # Step 2: DDIM 多步去噪重构
+                if hasattr(self, 'sampler'):
+                    n_samples = z_noisy_rec.shape[0]
+                    shape = (4, 64, 64)
+                    ddim_eta = 0.0
+                    
+                    # 使用当前条件进行重构（从 t_new 开始去噪）
+                    samples_ddim, sample_intermediates = self.sampler.sample_train(
+                        S=ddim_steps,
+                        conditioning=cond,
+                        batch_size=n_samples,
+                        shape=shape,
+                        verbose=False,
+                        unconditional_guidance_scale=5,
+                        unconditional_conditioning=None,
+                        eta=ddim_eta,
+                        x_T=z_noisy_rec,
+                        t=t_new,
+                        test_model_kwargs=None
+                    )
+                    
+                    # Step 3: ⭐ 获取所有中间步骤的 pred_x0 并解码到像素空间
+                    # 与原始 p_losses_face 保持一致：对所有中间步骤计算损失
+                    other_pred_x_0 = sample_intermediates['pred_x0']
+                    decoded_pred_x_0 = []
+                    for i in range(len(other_pred_x_0)):
+                        decoded = self.differentiable_decode_first_stage(other_pred_x_0[i])
+                        decoded_pred_x_0.append(decoded)
+                    
+                    # 用最后一步作为主要输出（用于重构损失）
+                    x_pred = decoded_pred_x_0[-1]
+                    
+                else:
+                    # 如果没有sampler，回退到单步预测
+                    print("警告: 未找到sampler，回退到单步预测")
+                    pred_x0 = self.predict_start_from_noise(z_t, t, pred_noise)
+                    x_pred = self.differentiable_decode_first_stage(pred_x0)
+                    decoded_pred_x_0 = [x_pred]  # 只有一个步骤
+            
+            # ⭐ 应用时间步权重到像素空间的损失（ID、重构、感知损失）
+            # 当t很小时，x_pred更接近真实图像，应该给予更大权重
             
             # 2.1 ID Loss - L_id = 1 - cos(e_ID_A1, e_ID_Ã)
+            # ⭐ 修改：与原始代码一致，对所有中间步骤计算并平均
             if self.aux_id_loss_weight > 0 and hasattr(self, 'face_ID_model'):
-                # ⭐ 优先使用未mask的参考图像 ref_raw
-                source_for_id = ref_raw if ref_raw is not None else reference
-                
-                if source_for_id is not None:
+                # ⭐ 直接使用已mask的参考图像 reference（数据加载时已处理）
+                if reference is not None:
                     # 准备Source图像B（从CLIP归一化转为标准归一化）
-                    source_normalized = un_norm_clip(source_for_id)
+                    source_normalized = un_norm_clip(reference)
                     source_normalized = TF.normalize(source_normalized,
                                                     mean=[0.5, 0.5, 0.5],
                                                     std=[0.5, 0.5, 0.5])
@@ -1851,41 +1969,66 @@ class LatentDiffusion(DDPM):
             if self.aux_id_loss_weight > 0 and source_normalized is not None and hasattr(self, 'face_ID_model'):
                 
                 # 准备mask（只在人脸区域计算）
-                mask = 1 - TF.resize(z_start_w[:, 8, :, :],
-                                    (x_pred.shape[2], x_pred.shape[3]))
+                masks = 1 - TF.resize(z_start_w[:, 8, :, :],
+                                     (decoded_pred_x_0[0].shape[2], decoded_pred_x_0[0].shape[3]))
                 
-                # 应用mask
-                x_pred_masked = x_pred * mask.unsqueeze(1)
+                # ⭐ 只用最后一步计算ID损失（节省显存和计算）
+                # 如果想要所有步骤，在显存充足时再改回来
+                x_pred_final = decoded_pred_x_0[-1]  # 只取最后一步
+                x_pred_masked = x_pred_final * masks.unsqueeze(1)
                 
                 # 计算ID损失（余弦相似度损失）
-                # 论文: L_id = 1 - cos(e_ID_A1, e_ID_Ã)
                 loss_id, sim_imp, _ = self.face_ID_model(
                     x_pred_masked, source_normalized, clip_img=False
                 )
                 
-                loss_total += self.aux_id_loss_weight * loss_id
+                # ⭐ 应用时间步权重
+                loss_total += self.aux_id_loss_weight * loss_id * timestep_weight
                 loss_dict[f'{prefix}/loss_id'] = loss_id
                 loss_dict[f'{prefix}/sim_imp'] = sim_imp
             
-            # 2.2 Reconstruction Loss - L_rec = ||ID_A2 - ID_Ã||_2^2
-            # 这里L2损失（感知上更好）
+            # 2.2 L2 Reconstruction Loss - L_rec = ||A - Ã||_2^2
+            # 只用最后一步计算重构损失
+            if self.aux_reconstruct_weight > 0 and GT_w is not None:
+                # 计算L2重构损失
+                loss_rec_l2 = self.get_loss(x_pred, GT_w, mean=True)
+                
+                # ⭐ 应用时间步权重
+                loss_total += self.aux_reconstruct_weight * loss_rec_l2 * timestep_weight
+                loss_dict[f'{prefix}/loss_rec_l2'] = loss_rec_l2
+            
+            # 2.3 ⭐ LPIPS Perceptual Loss - L_lpips = LPIPS(A, Ã)
+            # ⭐ 只用最后一步（节省显存），多尺度
             if self.aux_lpips_loss_weight > 0 and GT_w is not None and hasattr(self, 'lpips_loss'):
-                #计算L2损失
-                loss_rec = self.get_loss(x_pred, GT_w, mean=True)
-                loss_total += self.aux_lpips_loss_weight * loss_rec
-                loss_dict[f'{prefix}/loss_rec'] = loss_rec
+                if self.aux_lpips_multiscale:
+                    # 只用最后一步 × 多尺度
+                    loss_lpips = 0
+                    for scale_idx in range(3):  # 3个尺度：512, 256, 128
+                        scale_size = 512 // (2 ** scale_idx)
+                        loss_lpips_scale = self.lpips_loss(
+                            F.adaptive_avg_pool2d(x_pred, (scale_size, scale_size)),
+                            F.adaptive_avg_pool2d(GT_w, (scale_size, scale_size))
+                        ).mean()
+                        loss_lpips += loss_lpips_scale
+                        loss_dict[f'{prefix}/loss_lpips_scale_{scale_idx}'] = loss_lpips_scale
+                else:
+                    # 单尺度：只用最后一步
+                    loss_lpips = self.lpips_loss(x_pred, GT_w).mean()
+                
+                # ⭐ 应用时间步权重
+                loss_total += self.aux_lpips_loss_weight * loss_lpips * timestep_weight
+                loss_dict[f'{prefix}/loss_lpips'] = loss_lpips
                 
         
         # ========== 总损失 ==========
-        # 论文: L = λ_id * L_id + λ_DM * L_DM + λ_rec * L_rec
+        # 论文: L = λ_id * L_id + λ_DM * L_DM + λ_rec * L_rec + λ_lpips * L_lpips
+        # ⭐ 新增：时间步权重机制，当t小时给予更大权重
         loss_dict[f'{prefix}/loss'] = loss_total
         
-        # ⭐ 修复阻塞问题：commit=False，避免每个batch都等待上传
         if wandb.run is not None:
             wandb.log(loss_dict, commit=False)
         
         return loss_total, loss_dict
-
 
     def p_losses_dpo(self, z_start_w, z_start_l, cond, t, reference=None, ref_raw=None, GT_w=None, landmarks=None):
         """
@@ -2339,8 +2482,17 @@ class LatentDiffusion(DDPM):
                         test_dataset = FFHQdataset(split='test', **test_args)
                     
                     if test_dataset is not None:
-                        # 创建测试dataloader
+                        # ⭐ 限制数据集大小为test_num_samples，避免加载多余数据
                         import torch.utils.data
+                        num_samples = getattr(self, 'test_num_samples', 200)
+                        original_size = len(test_dataset)
+                        if original_size > num_samples:
+                            test_dataset = torch.utils.data.Subset(test_dataset, range(num_samples))
+                            print(f"[Test] Limited dataset to {num_samples} samples (original: {original_size} samples)")
+                        else:
+                            print(f"[Test] Using full test dataset: {original_size} samples")
+                        
+                        # 创建测试dataloader
                         test_dataloader = torch.utils.data.DataLoader(
                             test_dataset,
                             batch_size=self.test_batch_size,
@@ -2349,7 +2501,7 @@ class LatentDiffusion(DDPM):
                             shuffle=False,
                             drop_last=False
                         )
-                        print(f"[Test] Created test dataset: {dataset_name} with {len(test_dataset)} samples")
+                        print(f"[Test] Created test dataset: {dataset_name}")
                 
             except Exception as e:
                 print(f"[Test] Failed to create test dataset: {e}")
@@ -2464,8 +2616,8 @@ class LatentDiffusion(DDPM):
                     }
                     
                     # 处理 unconditional_conditioning (uc)（参考inference_test_bench.py第498-512行）
-                    # 获取测试时的scale参数（默认不使用guidance，scale=1.0）
-                    test_scale = getattr(self, 'test_guidance_scale', 1.0)
+                    # 获取测试时的scale参数（默认与推理时保持一致，scale=3.0）
+                    test_scale = getattr(self, 'test_guidance_scale', 3.0)
                     uc = None
                     if test_scale != 1.0:
                         uc = self.learnable_vector.repeat(test_batch.shape[0], 1, 1)
@@ -2553,12 +2705,18 @@ class LatentDiffusion(DDPM):
                         )
                     
                     samples_generated += batch_size
+                    # ⭐ 添加进度输出
+                    print(f"[Test] Progress: {samples_generated}/{num_samples} samples generated", end='\r')
+                    
                     if samples_generated >= num_samples:
+                        print()  # 换行
                         break
             
-            print(f"[Test] Generated {samples_generated} samples, saved to {test_output_dir}")
+            print(f"\n[Test] ✅ Completed! Generated {samples_generated} samples, saved to {test_output_dir}")
             
             # 5. 调用评估脚本计算指标
+            #try,防止显存不够
+            
             self.calculate_test_metrics(test_output_dir, tmp_dir)
             
         except Exception as e:
@@ -2813,7 +2971,7 @@ class LatentDiffusion(DDPM):
     @torch.no_grad()
     def log_images(self, batch, N=4, sample=True, ddim_steps=50, ddim_eta=1., return_keys=None, **kwargs):
         """
-        记录DPO训练的关键图片（仅记录网络实际使用的）
+        记录SFT或DPO训练的关键图片
         
         Args:
             batch: 数据批次
@@ -2824,56 +2982,68 @@ class LatentDiffusion(DDPM):
             
         Returns:
             log: 包含以下内容的字典
-                - src: 参考人脸（完整，用于ID loss，ref_img_raw）
-                - tgt: 目标图像（提供背景和姿态，被遮罩的inpaint_image）
-                - winner: 赢样本（好的换脸结果）
-                - loser: 输样本（差的换脸结果）
+                - ref_imgs: 参考人脸（已mask）
+                - tgt: 目标图像
+                - tgt_mask: 目标mask
+                - x_w: 赢样本（好的换脸结果）
                 - output_current: 当前训练模型（EMA）生成的输出（可选）
-                - output_reference: 参考模型生成的输出（可选）
+                - output_reference: 参考模型生成的输出（可选，仅DPO模式）
         """
-        print(f"[DPO log_images] Called at step {self.global_step}, N={N}, sample={sample}")
+        mode = "DPO" if self.model_ref is not None else "SFT"
+        print(f"[{mode} log_images] Called at step {self.global_step}, N={N}, sample={sample}")
         
         try:
             use_ddim = ddim_steps is not None
             log = dict()
             
-            print(f"[DPO log_images] Getting input data...")
-            z, _, c, x_w, x_l, xrec_w, xrec_l, reference, mask, _, gt, inpaint_src, ref_raw = self.get_input(batch, self.first_stage_key,
-                                            return_first_stage_outputs=True,
-                                            force_c_encode=True,
-                                            return_original_cond=True,
-                                            get_mask=True,
-                                            get_reference=True,
-                                            get_gt=True,
-                                            get_inpaint=True,
-                                            get_ref_raw=True,  # ⭐ 新增：获取未mask的参考图像
-                                            bs=N)
+            print(f"[{mode} log_images] Getting input data...")
+            z, _, c, x_w, x_l, xrec_w, xrec_l, reference, mask, _, gt, inpaint_src = self.get_input(
+                batch, self.first_stage_key,
+                return_first_stage_outputs=True,
+                force_c_encode=True,
+                return_original_cond=True,
+                get_mask=True,
+                get_reference=True,
+                get_gt=True,
+                get_inpaint=True,
+                bs=N
+            )
 
             N = min(x_w.shape[0], N)
             
-            # ✅ 只记录DPO实际用到的核心图像
-            # src提供身份，tgt提供背景和姿态
-            if ref_raw is not None:
-                # 将 CLIP归一化 → [0,1] → 标准归一化[-1,1]
-                ref_raw_normalized = un_norm_clip(ref_raw)
-                ref_raw_normalized = TF.normalize(ref_raw_normalized, 
-                                                 mean=[0.5, 0.5, 0.5], 
-                                                 std=[0.5, 0.5, 0.5])
-                log["src"] = ref_raw_normalized    # Source: 完整的参考人脸（用于ID loss）
+            # 收集所有需要拼接的图像
+            images_to_concat = []
+            target_size = 512  # 统一尺寸
             
-            log["tgt"] = inpaint_src              # Target: 提供背景和姿态（被遮罩）
-            log["winner"] = x_w                   # Winner: 赢样本
-            log["loser"] = x_l                    # Loser: 输样本
+            # 1. 参考图像（已mask）
+            if reference is not None:
+                ref_normalized = un_norm_clip(reference)
+                ref_normalized = TF.normalize(ref_normalized, 
+                                             mean=[0.5, 0.5, 0.5], 
+                                             std=[0.5, 0.5, 0.5])
+                ref_resized = TF.resize(ref_normalized, (target_size, target_size))
+                images_to_concat.append(ref_resized)
             
-            num_logged = len(log)
-            print(f"[DPO log_images] Added {num_logged} base images (src, tgt, winner, loser)")
+            # 2. 目标图像
+            tgt_resized = TF.resize(gt, (target_size, target_size))
+            images_to_concat.append(tgt_resized)
+            
+            # 3. mask后的目标图像（直接使用数据集提供的inpaint_src）
+            tgt_masked_resized = TF.resize(inpaint_src, (target_size, target_size))
+            images_to_concat.append(tgt_masked_resized)
+            
+            # 4. 赢样本
+            x_w_resized = TF.resize(x_w, (target_size, target_size))
+            images_to_concat.append(x_w_resized)
+            
+            print(f"[{mode} log_images] Added 4 base images (ref_imgs, tgt, tgt_mask, x_w)")
 
             # 生成模型输出
             if sample:
-                print(f"[DPO log_images] Generating model outputs...")
+                print(f"[{mode} log_images] Generating model outputs...")
                 
-                # 1. 使用当前训练模型（EMA）生成
-                print(f"[DPO log_images] Sampling with current model (EMA)...")
+                # 5. 使用当前训练模型（EMA）生成
+                print(f"[{mode} log_images] Sampling with current model (EMA)...")
                 with self.ema_scope("Plotting"):
                     if self.first_stage_key == 'inpaint':
                         samples_current, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
@@ -2882,10 +3052,11 @@ class LatentDiffusion(DDPM):
                         samples_current, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
                                                     ddim_steps=ddim_steps, eta=ddim_eta)
                 x_samples_current = self.decode_first_stage(samples_current)
-                log["output_current"] = x_samples_current  # 当前模型输出
-                print(f"[DPO log_images] Added current model output")
+                x_samples_current_resized = TF.resize(x_samples_current, (target_size, target_size))
+                images_to_concat.append(x_samples_current_resized)
+                print(f"[{mode} log_images] Added current model output")
                 
-                # 2. 使用参考模型生成（仅在DPO模式下）
+                # 6. 使用参考模型生成（仅在DPO模式下）
                 if self.model_ref is not None:
                     print(f"[DPO log_images] Sampling with reference model...")
                     # 临时替换模型为参考模型
@@ -2899,7 +3070,8 @@ class LatentDiffusion(DDPM):
                             samples_ref, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
                                                         ddim_steps=ddim_steps, eta=ddim_eta)
                         x_samples_ref = self.decode_first_stage(samples_ref)
-                        log["output_reference"] = x_samples_ref  # 参考模型输出
+                        x_samples_ref_resized = TF.resize(x_samples_ref, (target_size, target_size))
+                        images_to_concat.append(x_samples_ref_resized)
                         print(f"[DPO log_images] Added reference model output")
                     finally:
                         # 恢复原模型
@@ -2908,9 +3080,20 @@ class LatentDiffusion(DDPM):
                     print(f"[SFT log_images] Skipping reference model (SFT mode)")
                     
             else:
-                print(f"[DPO log_images] Skipping model output (sample={sample})")
+                print(f"[{mode} log_images] Skipping model output (sample={sample})")
 
-            print(f"[DPO log_images] Successfully created log with {len(log)} images")
+            # 竖着拼接所有图像 (每个样本单独拼接)
+            concatenated_images = []
+            for i in range(N):
+                sample_images = [img[i:i+1] for img in images_to_concat]  # 取第i个样本
+                # 在高度维度拼接 [1, 3, H, W] -> [1, 3, H*n, W]
+                concat_img = torch.cat(sample_images, dim=2)
+                concatenated_images.append(concat_img)
+            
+            # 合并所有样本 [N, 3, H*n, W]
+            log["concatenated"] = torch.cat(concatenated_images, dim=0)
+            
+            print(f"[{mode} log_images] Successfully created concatenated image with {len(images_to_concat)} rows x {N} samples")
             
             if return_keys:
                 if np.intersect1d(list(log.keys()), return_keys).shape[0] == 0:
@@ -2920,7 +3103,7 @@ class LatentDiffusion(DDPM):
             return log
             
         except Exception as e:
-            print(f"[DPO log_images] ERROR: {e}")
+            print(f"[{mode} log_images] ERROR: {e}")
             import traceback
             traceback.print_exc()
             return {}

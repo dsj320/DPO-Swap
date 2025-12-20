@@ -13,10 +13,14 @@ export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH}"
 # ========================================
 
 # 要评测的样本目录（可以修改）
-TEST_SAMPLES_DIR="/data5/shuangjun.du/work/REFace/logs/dpo_filtered_data_with_sft_loss_rec_50/2025-12-05T01-14-35_train_dpo/tmp/test_samples_step_3900"
+TEST_SAMPLES_DIR="/data5/shuangjun.du/work/REFace/logs/sft_with_multistep_denoise_process/2025-12-13T09-44-24_train_dpo/tmp/test_samples_step_1000"
+
+# 是否保存FID统计信息（设置为"--save-stats"启用，留空""禁用）
+# SAVE_STATS="--save-stats"  # 启用保存统计信息（首次运行或强制更新时使用）
+SAVE_STATS=""  # 禁用（使用已缓存的统计信息）
 
 # GPU 设备
-DEVICE=1
+DEVICE=0
 
 # 是否限制样本数量（留空则评测全部）
 MAX_SAMPLES=200 # 例如设置为 100 则只评测前 100 个样本
@@ -56,10 +60,10 @@ if [ ! -d "$TEST_SAMPLES_DIR" ]; then
     exit 1
 fi
 
-# 统计样本数量
-SAMPLE_COUNT=$(ls -1 "$TEST_SAMPLES_DIR"/*.png 2>/dev/null | wc -l)
+# 统计样本数量（支持png和jpg）
+SAMPLE_COUNT=$(ls -1 "$TEST_SAMPLES_DIR"/*.{png,jpg,jpeg} 2>/dev/null | wc -l)
 if [ "$SAMPLE_COUNT" -eq 0 ]; then
-    echo "错误: 测试样本目录中没有 PNG 图像: $TEST_SAMPLES_DIR"
+    echo "错误: 测试样本目录中没有图像文件 (png/jpg): $TEST_SAMPLES_DIR"
     exit 1
 fi
 
@@ -99,10 +103,12 @@ echo "========================================" | tee -a "$OUTPUT_FILE"
 if [ -n "$MAX_SAMPLES" ]; then
     CUDA_VISIBLE_DEVICES=${DEVICE} python eval_tool/fid/fid_score.py --device cuda \
         --max-samples ${MAX_SAMPLES} \
+        ${SAVE_STATS} \
         "${DATASET_PATH}" \
         "${TEST_SAMPLES_DIR}" 2>&1 | tee -a "$OUTPUT_FILE"
 else
     CUDA_VISIBLE_DEVICES=${DEVICE} python eval_tool/fid/fid_score.py --device cuda \
+        ${SAVE_STATS} \
         "${DATASET_PATH}" \
         "${TEST_SAMPLES_DIR}" 2>&1 | tee -a "$OUTPUT_FILE"
 fi

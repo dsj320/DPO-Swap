@@ -1,5 +1,5 @@
 model:
-  base_learning_rate: 1.0e-06
+  base_learning_rate: 1.0e-05
   target: ldm.models.diffusion.ddpm_dpo.LatentDiffusion
   params:
     linear_start: 0.00085
@@ -26,7 +26,7 @@ model:
     test_during_training: true          # 启用训练时测试
     test_interval_steps: 1000          # 每1000步测试一次
     test_num_samples: 200              # 生成200个样本
-    test_batch_size: 10
+    test_batch_size: 5
     test_dataset_name: "FFHQ"     # 数据集名称: CelebA, FFHQ, FF++
     
     # 测试数据路径
@@ -43,8 +43,16 @@ model:
     aux_diffusion_weight: 1.0          # 扩散重构损失权重（对赢样本）
     aux_id_loss_weight: 0.3            # ID 损失权重
     aux_lpips_loss_weight: 0.1         # 感知损失权重（对赢样本）
+    aux_lpips_multiscale: True         # ⭐ 新增：LPIPS是否使用多尺度（参考DPO，3个尺度：512/256/128）
+    aux_reconstruct_weight: 1.0        # ⭐ 新增：L2重构损失权重（SFT模式）
     aux_reconstruct_ddim_steps: 4      # 重构的 DDIM 步数
     dpo_loss_weight: 0              # DPO 损失权重
+    use_timestep_weighting: True       # ⭐ 新增：是否使用与t成反比的权重
+    timestep_weight_scale: 1.0         # ⭐ 新增：时间步权重的缩放因子
+    
+    # ⭐ 可视化配置
+    visualize_denoise_process: True   # 是否可视化多步去噪的中间过程
+    visualize_interval_steps: 50      # 每N步可视化一次
 
     scheduler_config: # 10000 warmup steps
       target: ldm.lr_scheduler.LambdaLinearScheduler
@@ -136,7 +144,9 @@ data:
                   data_seed: 42
                   gray_outer_mask: True
                   remove_mask_tar: [1,2,4,5,8,9 ,6,7,10,11,12,17 ]
-                  preserve_mask_src: [1,2,4,5,8,9 ,6,7,10,11,12,17 ]
+                  # ⭐ 修改：只保留核心人脸区域（去掉耳朵8,9和脖子17）
+                  # 原因：减少干扰，让ref_imgs专注于核心面部特征
+                  preserve_mask_src: [1,2,4,5,6,7,10,11,12]  # skin, nose, eyes, brows, mouth, lips
       validation:
            target: ldm.data.test_bench_dataset.CelebAdataset
            params:
@@ -167,4 +177,5 @@ lightning:
     max_epochs: 20
     num_nodes: 1
     gpus: "0" #可见的gpu中选择哪些（PL 1.4.2 使用 gpus 而不是 accelerator+devices）
+    limit_val_batches: 0  # ⭐ 禁用验证，避免多GPU验证死锁（验证样本数不能被GPU数整除）
   

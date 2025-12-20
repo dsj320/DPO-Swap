@@ -44,12 +44,12 @@ name="REFace"
 PROJECT_ROOT="/data5/shuangjun.du/work/REFace"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH}"
 CONFIG="models/REFace/configs/project_ffhq.yaml"  
-Results_dir="results/FFHQ/REFace/ffhq_1"
+Results_dir="results/FFHQ/REFace/sft_with_multistep_denoise_process/2025-12-13T09-44-24_train_dpo"
 
-CUDA_VISIBLE_DEVICES=0 python scripts/inference_test_bench.py \
+CUDA_VISIBLE_DEVICES=3 python scripts/inference_test_bench.py \
     --outdir "${Results_dir}" \
     --config "${CONFIG}" \
-    --ckpt "/data5/shuangjun.du/work/REFace/last.ckpt" \
+    --ckpt "/data5/shuangjun.du/work/REFace/logs/sft_with_multistep_denoise_process/2025-12-13T09-44-24_train_dpo/checkpoints/last.ckpt" \
     --scale 3 \
     --n_samples 2 \
     --dataset "FFHQ" \

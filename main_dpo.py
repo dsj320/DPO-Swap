@@ -1,4 +1,4 @@
-import argparse, os, sys, datetime, glob, importlib, csv
+import argparse, os, sys, datetime, glob
 import numpy as np
 import time
 import torch
@@ -7,7 +7,7 @@ import pytorch_lightning as pl
 
 from packaging import version
 from omegaconf import OmegaConf
-from torch.utils.data import random_split, DataLoader, Dataset, Subset
+from torch.utils.data import DataLoader, Dataset
 from functools import partial
 from PIL import Image
 
@@ -19,8 +19,6 @@ from pytorch_lightning.utilities import rank_zero_info
 
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config
-import socket
-from pytorch_lightning.plugins.environments import ClusterEnvironment,SLURMEnvironment
 import wandb
 wandb.login(key="f0a412d675fd5439a95ac8369fe5fe7b6acf6fc7")
 
@@ -52,7 +50,6 @@ def get_parser(**parser_kwargs):
         type=str,
         const=True,
         default="",
-        # default="models/REFace/checkpoints/last.ckpt",
         nargs="?",
         help="resume from logdir or checkpoint in logdir",
     )
@@ -82,20 +79,6 @@ def get_parser(**parser_kwargs):
         nargs="?",
         help="disable test",
     )
-    parser.add_argument(
-        "--train_cross_attn_only",
-        type=str2bool,
-        const=True,
-        default=False,
-        nargs="?",
-        help="train cross attn only",
-    )
-    parser.add_argument(
-        "-p",
-        "--project",
-        help="name of new or path to existing project"
-    )
-    
     parser.add_argument(
         "-d",
         "--debug",
@@ -139,14 +122,6 @@ def get_parser(**parser_kwargs):
         const=True,
         default=False,
         help="scale base-lr by ngpu * batch_size * n_accumulate",
-    )
-    parser.add_argument(
-        "--train_from_scratch",
-        type=str2bool,
-        nargs="?",
-        const=True,
-        default=False,
-        help="Train from scratch",
     )
     return parser
 
@@ -360,11 +335,25 @@ class ImageLogger(Callback):
             from PIL import Image as PILImage
             import torch.nn.functional as F
             
-            # 定义布局：
-            # 第 1 行：src, tgt, winner
-            # 第 2 行：output_reference, output_current, loser
-            row1_keys = ['src', 'tgt', 'winner']
-            row2_keys = ['output_reference', 'output_current', 'loser']
+            # 根据是否有参考模型输出，定义要显示的图像顺序（每行一种类型）
+            has_reference = 'output_reference' in images
+            
+            if has_reference:
+                # DPO 模式：有参考模型（5行）
+                # 第 1 行：src
+                # 第 2 行：tgt
+                # 第 3 行：winner
+                # 第 4 行：loser
+                # 第 5 行：output_reference
+                # 第 6 行：output_current
+                row_keys_list = ['src', 'tgt', 'winner', 'loser', 'output_reference', 'output_current']
+            else:
+                # SFT 模式：无参考模型（4行）
+                # 第 1 行：src
+                # 第 2 行：tgt
+                # 第 3 行：winner
+                # 第 4 行：output_current
+                row_keys_list = ['src', 'tgt', 'winner', 'output_current']
             
             def resize_tensor_to_512(tensor):
                 """将 tensor resize 到 512x512"""
@@ -374,30 +363,21 @@ class ImageLogger(Callback):
                 print(f"    Resizing from {tensor.shape[2]}x{tensor.shape[3]} to 512x512")
                 return F.interpolate(tensor, size=(512, 512), mode='bilinear', align_corners=False)
             
-            def create_row_grid(keys_list):
-                """为一行创建拼接的 grid"""
-                row_tensors = []
-                for k in keys_list:
-                    if k in images:
-                        img_tensor = images[k].detach().cpu()
-                        # 统一 resize 到 512
-                        img_tensor = resize_tensor_to_512(img_tensor)
-                        row_tensors.append(img_tensor)
-                        print(f"  Added {k}: shape={img_tensor.shape}")
-                
-                if not row_tensors:
+            def create_single_row_grid(key):
+                """为单个类型创建一行 grid（横向显示所有样本）"""
+                if key not in images:
                     return None
                 
-                # 拼接所有类别的图片
-                all_imgs = torch.cat(row_tensors, dim=0)
+                img_tensor = images[key].detach().cpu()
+                # 统一 resize 到 512
+                img_tensor = resize_tensor_to_512(img_tensor)
                 
-                # 每个类别有 N 个样本，横向排列
-                num_samples_per_category = images[keys_list[0]].shape[0] if keys_list[0] in images else 4
+                print(f"  Creating row for {key}: shape={img_tensor.shape}")
                 
-                # 创建 grid: 每类一行，横向显示该类的所有样本
+                # 创建 grid: 所有样本横向排列
                 grid = torchvision.utils.make_grid(
-                    all_imgs,
-                    nrow=num_samples_per_category,
+                    img_tensor,
+                    nrow=img_tensor.shape[0],  # 所有样本放在一行
                     normalize=True,
                     value_range=(-1, 1),
                     padding=2
@@ -409,47 +389,50 @@ class ImageLogger(Callback):
                 grid_np = (grid_np * 255).astype(np.uint8)
                 return PILImage.fromarray(grid_np)
             
-            # 生成两行
-            print(f"[_wandb] Creating row 1: {row1_keys}")
-            pil_row1 = create_row_grid(row1_keys)
+            # 生成每一行
+            pil_rows = []
+            for key in row_keys_list:
+                print(f"[_wandb] Creating row for: {key}")
+                pil_row = create_single_row_grid(key)
+                if pil_row is not None:
+                    pil_rows.append(pil_row)
             
-            print(f"[_wandb] Creating row 2: {row2_keys}")
-            pil_row2 = create_row_grid(row2_keys)
-            
-            if pil_row1 is None and pil_row2 is None:
+            if not pil_rows:
                 print("[_wandb] No valid images to create grid")
                 return
             
-            # 垂直拼接两行
-            if pil_row1 is not None and pil_row2 is not None:
-                max_width = max(pil_row1.width, pil_row2.width)
-                total_height = pil_row1.height + pil_row2.height
-                
-                final_img = PILImage.new('RGB', (max_width, total_height), (255, 255, 255))
-                final_img.paste(pil_row1, (0, 0))
-                final_img.paste(pil_row2, (0, pil_row1.height))
-                
-                print(f"[_wandb] Final grid: {final_img.size} (row1: {pil_row1.size}, row2: {pil_row2.size})")
-                
-            elif pil_row1 is not None:
-                final_img = pil_row1
-                print(f"[_wandb] Only row 1: {final_img.size}")
-            else:
-                final_img = pil_row2
-                print(f"[_wandb] Only row 2: {final_img.size}")
+            # 垂直拼接所有行
+            max_width = max(row.width for row in pil_rows)
+            total_height = sum(row.height for row in pil_rows)
+            
+            final_img = PILImage.new('RGB', (max_width, total_height), (255, 255, 255))
+            
+            current_y = 0
+            for i, pil_row in enumerate(pil_rows):
+                final_img.paste(pil_row, (0, current_y))
+                current_y += pil_row.height
+                print(f"[_wandb] Pasted row {i+1} at y={current_y - pil_row.height}")
+            
+            print(f"[_wandb] Final grid: {final_img.size} with {len(pil_rows)} rows")
             
             # ⭐ 关键修改：使用 commit=False 避免阻塞
             # wandb会在后台异步上传，不会阻塞训练
+            # 生成描述
+            mode = "DPO" if has_reference else "SFT"
+            rows_desc = " | ".join([f"Row{i+1}: {key}" for i, key in enumerate(row_keys_list) if key in images])
+            caption = f"Step {pl_module.global_step} | {mode} Mode | {rows_desc}"
+            
+            # 在键名中包含步数，使文件名更清晰
             wandb_log = {
-                f"{split}/all_samples": wandb.Image(
+                f"{split}/all_samples_step_{pl_module.global_step:06d}": wandb.Image(
                     final_img,
-                    caption=f"Step {pl_module.global_step} | Row1: {', '.join(row1_keys)} | Row2: {', '.join(row2_keys)}"
+                    caption=caption
                 )
             }
             
             # ⭐ commit=False: 不立即同步，由wandb后台处理
-            wandb.log(wandb_log, commit=False)
-            print(f"✓ Successfully queued image to wandb (non-blocking)")
+            wandb.log(wandb_log, step=pl_module.global_step, commit=False)
+            print(f"✓ Successfully queued image to wandb at step {pl_module.global_step} (non-blocking)")
                 
         except Exception as e:
             print(f"✗ ERROR logging images to wandb: {e}")
@@ -524,6 +507,7 @@ class ImageLogger(Callback):
             return True
         return False
 
+    @rank_zero_only  # ← 修复：只在主进程执行，避免多GPU重复调用导致死锁
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
         print(f"[ImageLogger.on_train_batch_end] Called at global_step={pl_module.global_step}, batch_idx={batch_idx}, disabled={self.disabled}")
         if not self.disabled and (pl_module.global_step > 0 or self.log_first_step):
@@ -531,10 +515,9 @@ class ImageLogger(Callback):
             self.log_img(pl_module, batch, batch_idx, split="train")
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
-        print(f"[ImageLogger.on_validation_batch_end] Called at global_step={pl_module.global_step}, batch_idx={batch_idx}, disabled={self.disabled}")
-        if not self.disabled and pl_module.global_step > 0:
-            print(f"[ImageLogger.on_validation_batch_end] Calling log_img...")
-            self.log_img(pl_module, batch, batch_idx, split="val")
+        # ⭐ 禁用验证阶段的图片记录，避免 DDIM 采样导致验证过程过慢
+        # 验证阶段的 log_images 会触发 50+ 步 DDIM 推理，非常耗时
+        pass
         if hasattr(pl_module, 'calibrate_grad_norm'):
             if (pl_module.calibrate_grad_norm and batch_idx % 25 == 0) and batch_idx > 0:
                 self.log_gradients(trainer, pl_module, batch_idx=batch_idx)
@@ -599,8 +582,6 @@ class CUDACallback(Callback):
 if __name__ == "__main__":
 
     now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-
-    
     sys.path.append(os.getcwd())
 
     parser = get_parser()
@@ -609,9 +590,7 @@ if __name__ == "__main__":
     opt, unknown = parser.parse_known_args()
     
     if opt.debug:
-        # set cuda visible devices =3
         os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-        
     
     if opt.name and opt.resume:
         raise ValueError(
@@ -624,8 +603,6 @@ if __name__ == "__main__":
             raise ValueError("Cannot find {}".format(opt.resume))
         if os.path.isfile(opt.resume):
             paths = opt.resume.split("/")
-            # idx = len(paths)-paths[::-1].index("logs")+1
-            # logdir = "/".join(paths[:idx])
             logdir = "/".join(paths[:-2])
             ckpt = opt.resume
         else:
@@ -654,8 +631,7 @@ if __name__ == "__main__":
     cfgdir = os.path.join(logdir, "configs")
     seed_everything(opt.seed)
 
-    # try:
-        # init and save configs
+    # init and save configs
     configs = [OmegaConf.load(cfg) for cfg in opt.base]
     cli = OmegaConf.from_dotlist(unknown)
     config = OmegaConf.merge(*configs, cli)
@@ -732,7 +708,6 @@ if __name__ == "__main__":
         print(f"[WANDB Config] Tags: {wandb_tags}")
     
     # 手动初始化 wandb（原始方式）- 只在主进程
-    from pytorch_lightning.utilities import rank_zero_only
     import torch.distributed as dist
     
     # 检查当前进程的 rank
@@ -758,8 +733,6 @@ if __name__ == "__main__":
             _disable_meta=False,   # 启用元数据
             _save_requirements=False,  # 不保存 requirements
             _file_stream_timeout_seconds=30,  # 文件流超时
-            # ⭐ 关键设置：禁用阻塞式同步
-            # _sync_media_timeout=10,  # 媒体同步超时10秒 (此参数在新版wandb中不支持，已注释)
             _stats_sample_rate_seconds=30,  # 降低统计采样频率
             _stats_samples_to_average=10,  # 统计样本平均数
         )
@@ -814,7 +787,6 @@ if __name__ == "__main__":
         print(f"[WANDB Rank {rank}] Skipping wandb.init() - not main process")
     
     print(config)
-    
 
     # model
     model = instantiate_from_config(config.model)
@@ -973,14 +945,14 @@ if __name__ == "__main__":
             "params": {
                 "batch_frequency":50,
                 "max_images": 3,
-                "clamp": True
+                "clamp": True,
+                "log_first_step": False  # 避免第一步就记录图像，提升启动速度
             }
         },
         "learning_rate_logger": {
             "target": "pytorch_lightning.callbacks.LearningRateMonitor",
             "params": {
                 "logging_interval": "step",
-                # "log_momentum": True
             }
         },
         "cuda_callback": {
@@ -1035,8 +1007,7 @@ if __name__ == "__main__":
         trainer_kwargs["distributed_backend"] = distributed_backend_value
 
     trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
-    # trainer.plugins = [MyCluster()]
-    trainer.logdir = logdir  ###
+    trainer.logdir = logdir
 
     # data
     data = instantiate_from_config(config.data)
@@ -1066,9 +1037,6 @@ if __name__ == "__main__":
         accumulate_grad_batches = lightning_config.trainer.accumulate_grad_batches
     else:
         accumulate_grad_batches = 1
-    # if 'num_nodes' in lightning_config.trainer:
-    #     num_nodes = lightning_config.trainer.num_nodes
-    # else:
     num_nodes = 1
     print(f"accumulate_grad_batches = {accumulate_grad_batches}")
     lightning_config.trainer.accumulate_grad_batches = accumulate_grad_batches
@@ -1105,7 +1073,6 @@ if __name__ == "__main__":
     # 创建一个标志来跟踪是否已经保存过checkpoint（避免重复保存）
     _checkpoint_saved = threading.Lock()
     _saving_checkpoint = False
-    _interrupt_count = 0  # 记录中断次数
 
     def safe_save_checkpoint():
         """安全地保存checkpoint，避免重复保存"""
