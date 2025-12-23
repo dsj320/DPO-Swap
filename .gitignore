@@ -35,6 +35,7 @@ __pycache__/
 /results/
 *.log
 *.mat
+*.json
 
 # 忽略超大模型文件（超过 GitHub 限制）
 Other_dependencies/DLIB_landmark_det/*.dat

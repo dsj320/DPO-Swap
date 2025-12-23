@@ -13,7 +13,7 @@ export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH}"
 # ========================================
 
 # 要评测的样本目录（可以修改）
-TEST_SAMPLES_DIR="/data5/shuangjun.du/work/REFace/logs/sft_with_multistep_denoise_process/2025-12-13T09-44-24_train_dpo/tmp/test_samples_step_1000"
+TEST_SAMPLES_DIR="/data5/shuangjun.du/datasets/benchmark/result/SimSwap/FFHQ"
 
 # 是否保存FID统计信息（设置为"--save-stats"启用，留空""禁用）
 # SAVE_STATS="--save-stats"  # 启用保存统计信息（首次运行或强制更新时使用）
@@ -23,7 +23,7 @@ SAVE_STATS=""  # 禁用（使用已缓存的统计信息）
 DEVICE=0
 
 # 是否限制样本数量（留空则评测全部）
-MAX_SAMPLES=200 # 例如设置为 100 则只评测前 100 个样本
+MAX_SAMPLES=1000 # 例如设置为 100 则只评测前 100 个样本
 
 # 数据集路径（根据你的数据集选择 CelebA 或 FFHQ）
 DATASET_TYPE="ffhq"  # "celeba" 或 "ffhq"

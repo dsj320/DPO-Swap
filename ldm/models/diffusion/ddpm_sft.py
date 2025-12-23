@@ -1856,60 +1856,18 @@ class LatentDiffusion(DDPM):
         
         # 采样一个新的 t_new（固定为最大时间步，用于重建损失计算）
         # 从最大噪声状态开始去噪，测试完整的去噪能力
-        t_new = torch.randint(
-            self.num_timesteps - 1, 
-            self.num_timesteps, 
-            (z_start_w.shape[0],), 
-            device=self.device
-        ).long()
+        # t_new = torch.randint(
+        #     self.num_timesteps - 1, 
+        #     self.num_timesteps, 
+        #     (z_start_w.shape[0],), 
+        #     device=self.device
+        # ).long()
         
-        # 使用 t_new 重新加噪（从最大噪声开始）
-        z_t_new = self.q_sample(x_start=z0_A, t=t_new, noise=noise)
+        # # 使用 t_new 重新加噪（从最大噪声开始）
+        # z_t_new = self.q_sample(x_start=z0_A, t=t_new, noise=noise)
         
         # ========== 2️⃣ ID Loss (L_id) + Reconstruction Loss (L_rec) + LPIPS Loss ==========
-        
-        if (self.aux_id_loss_weight > 0 or self.aux_lpips_loss_weight > 0 or self.aux_reconstruct_weight > 0):
-            # ⭐ 根据配置选择单步预测或多步去噪
-            ddim_steps = self.aux_reconstruct_ddim_steps
-            
-            if ddim_steps == 1:
-                pred_x0 = self.predict_start_from_noise(z_t, t, pred_noise)
-                x_pred = self.differentiable_decode_first_stage(pred_x0)
-            else:
-                # 使用多步DDIM去噪获取x0
-                # Step 1: 准备输入（使用 z_t_new，从最大时间步开始去噪）
-                z_noisy_rec = torch.cat((z_t_new, z_start_w[:, 4:, :, :]), dim=1)
-                
-                # Step 2: DDIM 多步去噪重构
-                if hasattr(self, 'sampler'):
-                    n_samples = z_noisy_rec.shape[0]
-                    shape = (4, 64, 64)
-                    ddim_eta = 0.0
-                    
-                    # 使用当前条件进行重构（从 t_new 开始去噪）
-                    samples_ddim, sample_intermediates = self.sampler.sample_train(
-                        S=ddim_steps,
-                        conditioning=cond,
-                        batch_size=n_samples,
-                        shape=shape,
-                        verbose=False,
-                        unconditional_guidance_scale=5,
-                        unconditional_conditioning=None,
-                        eta=ddim_eta,
-                        x_T=z_noisy_rec,
-                        t=t_new,
-                        test_model_kwargs=None
-                    )
-                    
-                    # Step 3: 多步去噪
-                    other_pred_x_0 = sample_intermediates['pred_x0']
-                    decoded_pred_x_0 = []
-                    for i in range(len(other_pred_x_0)):
-                        decoded = self.differentiable_decode_first_stage(other_pred_x_0[i])
-                        decoded_pred_x_0.append(decoded)
-                    
-                    # 用最后一步作为主要输出（用于重构损失）
-                    x_pred = decoded_pred_x_0[-1]
+       
                     
                 else:
                     # 如果没有sampler，回退到单步预测

@@ -102,5 +102,25 @@ python estimate_mask.py \
     --output_dir /data5/shuangjun.du/work/REFace/tmp/output \
     --faceParsing_ckpt Other_dependencies/face_parsing/79999_iter.pth 
 
+
+python estimate_mask.py \
+    --input_dir /data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/Val_crop_align_512_simswap \
+    --output_dir /data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/Val_crop_align_512_simswap_mask \
+    --faceParsing_ckpt Other_dependencies/face_parsing/79999_iter.pth \
+    --save_vis
+
+
+python estimate_mask.py \
+    --input_dir /data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/Val_target_crop_align_512_simswap \
+    --output_dir /data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/Val_target_crop_align_512_simswap_mask \
+    --faceParsing_ckpt Other_dependencies/face_parsing/79999_iter.pth \
+    --save_vis
+
+export CUDA_VISIBLE_DEVICES=0
+python estimate_mask.py \
+    --input_dir /data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/images512_crop_align_512_simswap \
+    --output_dir /data5/shuangjun.du/work/REFace/dataset/FaceData/FFHQ/images512_crop_align_512_simswap_mask \
+    --faceParsing_ckpt Other_dependencies/face_parsing/79999_iter.pth \
+    --save_vis
 """
 

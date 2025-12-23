@@ -5,8 +5,8 @@
 
 export WANDB_MODE=offline 
 
-CUDA_VISIBLE_DEVICES=2,3 python -u main_dpo.py \
-    --logdir logs/dpo_loss \
+CUDA_VISIBLE_DEVICES=1 python -u main_dpo.py \
+    --logdir logs/dpo_loss_test \
     --pretrained_model /data5/shuangjun.du/work/REFace/last.ckpt \
     --base configs/train_dpo.yaml \
     --scale_lr False \
@@ -37,20 +37,20 @@ CUDA_VISIBLE_DEVICES=2,3 python -u main_dpo.py \
     model.params.visualize_interval_steps=500 \
     \
     `# ===== 数据配置 =====` \
-    data.params.batch_size=6 \
-    data.params.train.params.data_manifest_path=/data5/shuangjun.du/work/REFace/dataset/dpo_data_filtered.json \
+    data.params.batch_size=10\
+    data.params.train.params.data_manifest_path=/data5/shuangjun.du/work/REFace/dataset/dpo_data_filtered_1000.json \
     \
     `# ===== 测试配置 =====` \
-    model.params.test_interval_steps=300 \
+    model.params.test_interval_steps=500 \
     model.params.test_num_samples=200 \
     model.params.test_batch_size=4 \
     \
     `# ===== GPU 配置 =====` \
-    lightning.trainer.gpus=2 \
+    lightning.trainer.gpus=1 \
     lightning.trainer.accumulate_grad_batches=4 \
     \
     `# ===== ImageLogger 配置 =====` \
-    lightning.callbacks.image_logger.params.batch_frequency=50 \
+    lightning.callbacks.image_logger.params.batch_frequency=20 \
     lightning.callbacks.image_logger.params.max_images=2 \
     \
     `# ===== Wandb 配置 =====` \

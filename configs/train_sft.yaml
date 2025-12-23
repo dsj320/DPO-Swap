@@ -30,11 +30,11 @@ model:
     test_dataset_name: "FFHQ"     # 数据集名称: CelebA, FFHQ, FF++
     
     # 测试数据路径
-    test_source_path: "./dataset/FaceData/FFHQ/Val"
-    test_target_path: "./dataset/FaceData/FFHQ/Val_target"
-    test_source_mask_path: "./dataset/FaceData/FFHQ/src_mask"
-    test_target_mask_path: "./dataset/FaceData/FFHQ/target_mask"
-    test_dataset_path: "./dataset/FaceData/FFHQ/images512"  # 用于FID
+    test_source_path: "./dataset/FaceData/FFHQ/Val_crop_align_512_simswap"
+    test_target_path: "./dataset/FaceData/FFHQ/Val_target_crop_align_512_simswap"
+    test_source_mask_path: "./dataset/FaceData/FFHQ/Val_crop_align_512_simswap_mask"
+    test_target_mask_path: "./dataset/FaceData/FFHQ/Val_target_crop_align_512_simswap_mask"
+    test_dataset_path: "./dataset/FaceData/FFHQ/images512_crop_align_512_simswap"  # 用于FID
     ####
 
 
@@ -132,7 +132,7 @@ data:
       batch_size: 3
       wrap: False
       train:
-          target: ldm.data.dpo_dataset.DPOFaceDataset
+          target: ldm.data.sft_dataset.SFTFaceDataset
           params:
               data_manifest_path: ./dataset/dpo_data_filtered.json
               args:
