@@ -33,12 +33,27 @@ __pycache__/
 /logs/
 /models/
 /results/
+/E/
+/test/
+/tmp/
 *.log
 *.mat
-*.json
+*.json 
 
 # 忽略超大模型文件（超过 GitHub 限制）
 Other_dependencies/DLIB_landmark_det/*.dat
 Other_dependencies/Hopenet_pose/*.pkl
 eval_tool/Deep3DFaceRecon_pytorch_edit/BFM/*.mat
 
+
+# 分析结果和评估输出
+/Quantitative_Analysis/
+/compressed_data/
+
+# 数据集目录（保留结构，但忽略数据文件）
+/dataset/FaceData/FFHQ/Val/
+/dataset/FaceData/FFHQ/Val_target/
+/dataset/FaceData/FFHQ/.fid_stats/
+
+# 第三方依赖
+/eval_tool/*/Other_dependencies/
