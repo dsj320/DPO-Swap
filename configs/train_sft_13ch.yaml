@@ -16,9 +16,9 @@ model:
     monitor: train/loss_epoch
     u_cond_percent: 0.2
     scale_factor: 0.18215
-    use_ema: True
-    ref_ckpt_path: ./last.ckpt
-    dpo_beta: 5000  # DPO 超参数，控制奖励函数的强度
+    use_ema: False
+
+
     use_sft_loss: True  # ⭐ 训练模式：True=SFT有监督微调，False=DPO偏好优化（默认）
     
     ##test参数
@@ -52,12 +52,13 @@ model:
     aux_reconstruct_weight: 1.0        # ⭐ 新增：L2重构损失权重（SFT模式）
     aux_reconstruct_ddim_steps: 4      # 重构的 DDIM 步数
     dpo_loss_weight: 0              # DPO 损失权重
+    aux_reconstruct_per_step: True  # ⭐ 新增：是否对每一步都计算重构loss
     
 
     scheduler_config: # 10000 warmup steps
       target: ldm.lr_scheduler.LambdaLinearScheduler
       params:
-        warm_up_steps: [ 500 ] #不用warmup那么多步了
+        warm_up_steps: [ 1000 ] #不用warmup那么多步了
         cycle_lengths: [ 10000000000000 ] # incredibly large number to prevent corner cases
         f_start: [ 1.e-6 ]
         f_max: [ 1. ]
@@ -186,5 +187,4 @@ lightning:
     max_epochs: 20
     num_nodes: 1
     gpus: "0" #可见的gpu中选择哪些（PL 1.4.2 使用 gpus 而不是 accelerator+devices）
-    limit_val_batches: 0  # ⭐ 禁用验证，避免多GPU验证死锁（验证样本数不能被GPU数整除）
-  
+    limit_val_batches: 0  # 

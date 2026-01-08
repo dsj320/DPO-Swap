@@ -207,8 +207,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
             init_fn = None
         return DataLoader(self.datasets["train"], batch_size=self.batch_size,
                           num_workers=self.num_workers, shuffle=False if is_iterable_dataset else True,
-                          worker_init_fn=init_fn,
-                          persistent_workers=True if self.num_workers > 0 else False)
+                          worker_init_fn=init_fn)
 
     def _val_dataloader(self, shuffle=False):
         if isinstance(self.datasets['validation'], Txt2ImgIterableBaseDataset) or self.use_worker_init_fn:
@@ -219,8 +218,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
                           batch_size=self.batch_size,
                           num_workers=self.num_workers,
                           worker_init_fn=init_fn,
-                          shuffle=shuffle,
-                          persistent_workers=True if self.num_workers > 0 else False)
+                          shuffle=shuffle)
 
     def _test_dataloader(self, shuffle=False):
         is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
@@ -233,8 +231,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
         shuffle = shuffle and (not is_iterable_dataset)
 
         return DataLoader(self.datasets["test"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, worker_init_fn=init_fn, shuffle=shuffle,
-                          persistent_workers=True if self.num_workers > 0 else False)
+                          num_workers=self.num_workers, worker_init_fn=init_fn, shuffle=shuffle)
 
     def _predict_dataloader(self, shuffle=False):
         if isinstance(self.datasets['predict'], Txt2ImgIterableBaseDataset) or self.use_worker_init_fn:
@@ -388,7 +385,7 @@ class ImageLogger(Callback):
 
     @rank_zero_only
     def _wandb(self, pl_module, images, batch_idx, split):
-        """记录图像到 wandb - 拼接成 2 行布局（处理不同尺寸）- 非阻塞版本"""
+        """记录图像到 wandb - 优先使用 concatenated 大图，否则拼接成网格布局"""
         try:
             print(f"[_wandb] Called with {len(images)} images: {list(images.keys())}")
             
@@ -399,6 +396,50 @@ class ImageLogger(Callback):
             from PIL import Image as PILImage
             import torch.nn.functional as F
             
+            # ⭐ 优先检查是否有 concatenated 键（已拼接好的大图）
+            if 'concatenated' in images:
+                print(f"[_wandb] Using pre-concatenated image from log_images")
+                concatenated_tensor = images['concatenated'].detach().cpu()
+                
+                # concatenated_tensor shape: [N, 3, H, W] - 每个样本已经是竖向拼接好的
+                print(f"[_wandb] Concatenated tensor shape: {concatenated_tensor.shape}")
+                
+                # 将多个样本横向排列成网格
+                # make_grid 会将 [N, 3, H, W] 转换为 [3, H_grid, W_grid]
+                grid = torchvision.utils.make_grid(
+                    concatenated_tensor,
+                    nrow=concatenated_tensor.shape[0],  # 所有样本放在一行
+                    normalize=True,
+                    value_range=(-1, 1),
+                    padding=2
+                )
+                
+                # grid shape: [3, H, W]，转换为 [H, W, 3] numpy array
+                grid_np = grid.permute(1, 2, 0).numpy()
+                grid_np = np.clip(grid_np, 0, 1)
+                grid_np = (grid_np * 255).astype(np.uint8)
+                final_img = PILImage.fromarray(grid_np)
+                
+                print(f"[_wandb] Final concatenated image size: {final_img.size}")
+                
+                # 发送到 wandb
+                # ⭐ 使用固定键名，让 wandb 自动覆盖并支持时间轴查看历史版本
+                current_step = wandb.run.step if wandb.run is not None else pl_module.global_step
+                mode = "DPO" if 'output_reference' in images else "SFT"
+                caption = f"Step {current_step} | {mode} Mode | Pre-concatenated (vertical per sample)"
+                # ⭐ 使用固定键名，wandb 会自动更新图片并支持时间轴查看
+                wandb_log = {
+                    f"{split}/all_samples": wandb.Image(
+                        final_img,
+                        caption=caption
+                    )
+                }
+                # ⭐ 不指定 step，让 wandb 自动使用当前 step（避免 step 不匹配警告）
+                wandb.log(wandb_log, commit=False)
+                print(f"✓ Successfully queued concatenated image to wandb at step {current_step} (non-blocking)")
+                return
+            
+            # 如果没有 concatenated，使用原来的拼接逻辑
             # 根据是否有参考模型输出，定义要显示的图像顺序（每行一种类型）
             has_reference = 'output_reference' in images
             
@@ -481,22 +522,25 @@ class ImageLogger(Callback):
             
             # ⭐ 关键修改：使用 commit=False 避免阻塞
             # wandb会在后台异步上传，不会阻塞训练
-            # 生成描述
+            # ⭐ 使用 wandb.run.step 获取当前 step，避免 step 不匹配警告
+            current_step = wandb.run.step if wandb.run is not None else pl_module.global_step
             mode = "DPO" if has_reference else "SFT"
             rows_desc = " | ".join([f"Row{i+1}: {key}" for i, key in enumerate(row_keys_list) if key in images])
-            caption = f"Step {pl_module.global_step} | {mode} Mode | {rows_desc}"
+            caption = f"Step {current_step} | {mode} Mode | {rows_desc}"
             
-            # 在键名中包含步数，使文件名更清晰
+            # ⭐ 使用固定键名，让 wandb 自动覆盖并支持时间轴查看历史版本
+            # 这样在 wandb 界面中只会显示一个图片记录，可以通过时间轴滑块查看不同步数的图片
             wandb_log = {
-                f"{split}/all_samples_step_{pl_module.global_step:06d}": wandb.Image(
+                f"{split}/all_samples": wandb.Image(
                     final_img,
                     caption=caption
                 )
             }
             
             # ⭐ commit=False: 不立即同步，由wandb后台处理
-            wandb.log(wandb_log, step=pl_module.global_step, commit=False)
-            print(f"✓ Successfully queued image to wandb at step {pl_module.global_step} (non-blocking)")
+            # ⭐ 不指定 step，让 wandb 自动使用当前 step（避免 step 不匹配警告）
+            wandb.log(wandb_log, commit=False)
+            print(f"✓ Successfully queued image to wandb at step {current_step} (non-blocking)")
                 
         except Exception as e:
             print(f"✗ ERROR logging images to wandb: {e}")
@@ -903,7 +947,7 @@ if __name__ == "__main__":
     trainer_kwargs = dict()
 
     # default logger configs
-    # 使用 testtube 作为 PyTorch Lightning logger，wandb 通过手动 init 管理
+    # 使用 WandbLogger 作为 PyTorch Lightning logger，这样 self.log() 的标量会直接记录到 wandb
     default_logger_cfgs = {
         "wandb": {
             "target": "pytorch_lightning.loggers.WandbLogger",
@@ -924,8 +968,8 @@ if __name__ == "__main__":
             }
         },
     }
-    # 使用 testtube logger，wandb 单独管理
-    default_logger_cfg = default_logger_cfgs["testtube"]
+    # 使用 wandb logger，让 Lightning 的 self.log() 指标直接写入 wandb
+    default_logger_cfg = default_logger_cfgs["wandb"]
     if "logger" in lightning_config:
         logger_cfg = lightning_config.logger
     else:

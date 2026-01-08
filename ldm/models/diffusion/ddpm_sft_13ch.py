@@ -481,7 +481,7 @@ class DDPM(pl.LightningModule):
         loss, loss_dict = self(x)
         return loss, loss_dict
 
-    #----------dpo training step----------
+    #----------training step,entry of the training process----------
     def training_step(self, batch, batch_idx):
         if not self.Reconstruct_initial:
             loss, loss_dict = self.shared_step(batch)       # original
@@ -495,7 +495,7 @@ class DDPM(pl.LightningModule):
             lr = self.optimizers().param_groups[0]['lr']
             self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
         return loss
-    #----------dpo training step end----------
+    #----------training step,entry of the training process end----------
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
@@ -507,7 +507,7 @@ class DDPM(pl.LightningModule):
             self.model_ema(self.model)
         
         # 在特定step进行测试
-        # ！！！！！！目前有bug,似乎在训练的时候测试间隔step过大会导致一个epoch结束后卡死，还不确定原因
+        # 测试频率过高可能会卡死
         if (hasattr(self, 'test_during_training') and self.test_during_training and 
             hasattr(self, 'test_interval_steps') and 
             self.global_step > 0 and self.global_step % self.test_interval_steps == 0):
@@ -573,17 +573,14 @@ class DDPM(pl.LightningModule):
 
 
 
-
+######################## modified by Shuangjun Du ################
 
 import torch
 import torch.nn as nn
 
-# --- 1. 基础组件：残差块 (ResBlock) ---
-# 作用：加深网络深度的同时，通过 x + f(x) 保证梯度不消失
 class ResBlock(nn.Module):
     def __init__(self, in_channels, out_channels=None):
         super().__init__()
-        # 如果不指定输出通道，默认保持输入通道数
         out_channels = out_channels or in_channels
         
         self.in_layers = nn.Sequential(
@@ -598,7 +595,6 @@ class ResBlock(nn.Module):
             nn.Conv2d(out_channels, out_channels, 3, 1, 1)
         )
         
-        # 如果输入输出通道不一致，需要用 1x1 卷积调整 x 的维度以便相加
         if in_channels == out_channels:
             self.skip_connection = nn.Identity()
         else:
@@ -609,42 +605,42 @@ class ResBlock(nn.Module):
         h = self.out_layers(h)
         return self.skip_connection(x) + h
 
-# --- 2. 升级版：Landmark ResNet 编码器 ---
+######################## LandmarkLightEncoder ################
 class LandmarkLightEncoder(nn.Module):
     def __init__(self, input_channels=3, output_channels=4, base_channels=64):
         super().__init__()
         
-        # 假设输入是 512x512，我们需要下采样 3 次 (stride=2) 变成 64x64
-        # 结构：Input -> [Stem] -> [Down1] -> [Down2] -> [Down3] -> Output
+        # the input shape is 512x512，we need to downsample 3 times (stride=2) to become 64x64
+        # the structure is: Input -> [Stem] -> [Down1] -> [Down2] -> [Down3] -> Output
         
-        # 1. Stem (入场层): 3 -> 64
+        # 1. Stem (entrance layer): 3 -> 64
         self.conv_in = nn.Conv2d(input_channels, base_channels, 3, 1, 1)
         
-        # 2. 中间层 (使用 ResBlock 提取特征 + Conv 下采样)
+        # 2. middle layer (use ResBlock to extract features + Conv downsample)
         
-        # Stage 1: 512x512 -> 256x256 (64 -> 128 channels)
+        # stage 1: 512x512 -> 256x256 (64 -> 128 channels)
         self.block1 = nn.Sequential(
             ResBlock(base_channels, base_channels),
             nn.Conv2d(base_channels, base_channels * 2, 3, 2, 1) # Downsample
         )
         
-        # Stage 2: 256x256 -> 128x128 (128 -> 256 channels)
+        # stage 2: 256x256 -> 128x128 (128 -> 256 channels)
         self.block2 = nn.Sequential(
             ResBlock(base_channels * 2, base_channels * 2),
             nn.Conv2d(base_channels * 2, base_channels * 4, 3, 2, 1) # Downsample
         )
         
-        # Stage 3: 128x128 -> 64x64 (256 -> 512 channels)
+        # stage 3: 128x128 -> 64x64 (256 -> 512 channels)
         self.block3 = nn.Sequential(
             ResBlock(base_channels * 4, base_channels * 4),
             nn.Conv2d(base_channels * 4, base_channels * 8, 3, 2, 1) # Downsample
         )
         
-        # 3. 再加一层 ResBlock 整理特征 (512 channels)
+        # 3. add one more ResBlock to refine the features (512 channels)
         self.block_out = ResBlock(base_channels * 8, base_channels * 8)
         
-        # 4. 最终映射层 (Mapping): 512 -> 4
-        # ⚠️ 注意：这里绝对没有 zero_module！必须正常初始化！
+        # 4. final mapping layer (Mapping): 512 -> 4
+        # ⚠️ attention: here absolutely no zero_module! must be initialized normally!
         self.conv_out = nn.Conv2d(base_channels * 8, output_channels, 3, 1, 1)
 
     def forward(self, x):
@@ -654,13 +650,13 @@ class LandmarkLightEncoder(nn.Module):
         h = self.block1(h)        # -> [B, 128, 256, 256]
         h = self.block2(h)        # -> [B, 256, 128, 128]
         h = self.block3(h)        # -> [B, 512, 64, 64]
-        h = self.block_out(h)     # -> [B, 512, 64, 64] (进一步提纯)
+        h = self.block_out(h)     # -> [B, 512, 64, 64] (further refine the features)
         
         out = self.conv_out(h)    # -> [B, 4, 64, 64]
         
         return out
 
-########3dmm encoder end########
+######################## LandmarkLightEncoder end ################
 
 
 
@@ -704,6 +700,7 @@ class LatentDiffusion(DDPM):
         aux_lpips_multiscale = kwargs.pop('aux_lpips_multiscale', True)  # ⭐ 新增：LPIPS多尺度
         aux_reconstruct_weight = kwargs.pop('aux_reconstruct_weight', 1.0)  # ⭐ 新增：L2重构损失权重
         aux_reconstruct_ddim_steps = kwargs.pop('aux_reconstruct_ddim_steps', 4)
+        aux_reconstruct_per_step = kwargs.pop('aux_reconstruct_per_step', False)  # ⭐ 新增：是否对每一步都计算重构loss
         dpo_loss_weight = kwargs.pop('dpo_loss_weight', 1.0)
         
         
@@ -718,7 +715,7 @@ class LatentDiffusion(DDPM):
         test_target_mask_path = kwargs.pop('test_target_mask_path', None)  # 测试目标mask路径
         test_dataset_path = kwargs.pop('test_dataset_path', None)  # 测试数据集路径（用于FID）
         test_batch_size = kwargs.pop('test_batch_size', 4)  # 测试时的batch size
-        test_guidance_scale = kwargs.pop('test_guidance_scale', 3.0)  # 测试时的guidance scale（参考inference_test_bench.sh，默认3.0）
+        test_guidance_scale = kwargs.pop('test_guidance_scale', 3.5)  # 测试时的guidance scale（参考inference_test_bench.sh，默认3.0）
         test_ddim_steps = kwargs.pop('test_ddim_steps', 50)  # 测试时的DDIM采样步数（参考inference_test_bench.sh，默认50）
         
         super().__init__(unet_config, conditioning_key=conditioning_key, *args, **kwargs)
@@ -743,31 +740,6 @@ class LatentDiffusion(DDPM):
         if use_sft_loss:
             print(f"✓ SFT 模式：跳过参考模型加载（节省显存）")
             self.model_ref = None  # SFT 不需要参考模型
-        else:
-            print(f"DPO: 正在实例化参考模型 (Reference Model)...")
-            self.model_ref = DiffusionWrapper(unet_config, conditioning_key)
-
-            if ref_ckpt_path is None:
-                print(f"DPO 警告: ref_ckpt_path 为 None。参考模型将使用随机权重。")
-            else:
-                print(f"DPO: 正在从 {ref_ckpt_path} 加载参考模型权重...")
-                sd = torch.load(ref_ckpt_path, map_location="cpu")
-                if "state_dict" in sd:
-                    sd = sd["state_dict"]
-                
-                model_ref_sd = {k.replace('model.diffusion_model.', ''): v 
-                                for k, v in sd.items() 
-                                if k.startswith('model.diffusion_model.')}
-                                
-                self.model_ref.diffusion_model.load_state_dict(model_ref_sd, strict=True)
-                print(f"DPO: 参考模型权重加载完毕。")
-
-            #-------------------DPO结束---------------------------------
-
-            self.model_ref.eval()
-            self.model_ref.train = disabled_train
-            for param in self.model_ref.parameters():
-                param.requires_grad = False  # 参考模型不更新权重
             
         # 保存 DPO 配置（已经从 kwargs 中提取）
         self.use_sft_loss = use_sft_loss  # ⭐ 新增
@@ -779,6 +751,7 @@ class LatentDiffusion(DDPM):
         self.aux_lpips_multiscale = aux_lpips_multiscale  # ⭐ 新增：LPIPS多尺度
         self.aux_reconstruct_weight = aux_reconstruct_weight  # ⭐ 新增：L2重构损失权重
         self.aux_reconstruct_ddim_steps = aux_reconstruct_ddim_steps
+        self.aux_reconstruct_per_step = aux_reconstruct_per_step  # ⭐ 新增：是否对每一步都计算重构loss
         self.dpo_loss_weight = dpo_loss_weight
         
     
@@ -797,6 +770,7 @@ class LatentDiffusion(DDPM):
             if self.aux_lpips_loss_weight > 0:
                 print(f"  - ⭐ LPIPS 多尺度: {self.aux_lpips_multiscale} {'(参考DPO: 512/256/128)' if self.aux_lpips_multiscale else '(单尺度)'}")
             print(f"  - DDIM 重构步数: {self.aux_reconstruct_ddim_steps}")
+            print(f"  - ⭐ 每步计算重构loss: {self.aux_reconstruct_per_step} {'(参考ddpm.py，对每一步都计算)' if self.aux_reconstruct_per_step else '(只计算最后一步)'}")
         self.concat_mode = concat_mode
         self.cond_stage_trainable = cond_stage_trainable
         self.cond_stage_key = cond_stage_key
@@ -913,10 +887,7 @@ class LatentDiffusion(DDPM):
                 self.landmark_proj_out=nn.Identity()
             if self.stack_feat:
                 self.landmark_proj_out=nn.Linear(136, 768)
-        # total_devices = self.hparams.n_gpus * self.hparams.n_nodes
-        # self.train_batches = len(self.train_dataloader()) // total_devices
-        # self.train_reduce_steps = (self.hparams.epochs * self.train_batches) // (self.hparams.accumulate_grad_batches * 2) # for half of the time full trining with ID
-        # self.change_weights=2/self.train_steps
+  
         self.total_steps_in_epoch=0 # will be calculated inside training_step. Not known for now
         
         if cond_stage_config.target=="ldm.modules.encoders.modules.FrozenCLIPImageEmbedder":
@@ -1382,138 +1353,35 @@ class LatentDiffusion(DDPM):
 
         return fold, unfold, normalization, weighting
 
-    # @torch.no_grad()
-    # def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
-    #           cond_key=None, return_original_cond=False, bs=None, get_mask=False, 
-    #           get_reference=False, get_landmarks_out=False, get_gt=False, get_inpaint=False,
-    #           get_ref_raw=False):  # 新增参数
-    
-    #     # 1. 获取所有输入 (大小 B)
-    #     x_w = batch['GT_w'].to(self.device, memory_format=torch.contiguous_format).float()
-    #     x_l = batch['GT_l'].to(self.device, memory_format=torch.contiguous_format).float()
-    #     GT_original = batch['GT'].to(self.device, memory_format=torch.contiguous_format).float()
-    #     inpaint = batch['inpaint_image'].to(self.device, memory_format=torch.contiguous_format).float()
-    #     mask = batch['inpaint_mask'].to(self.device, memory_format=torch.contiguous_format).float()
-    #     reference = batch['ref_imgs'].to(self.device, memory_format=torch.contiguous_format).float()
-        
-    #     # 新增：获取未mask的参考图像（如果需要）
-    #     if 'ref_img_raw' in batch:
-    #         ref_raw = batch['ref_img_raw'].to(self.device, memory_format=torch.contiguous_format).float()
-    #     else:
-    #         ref_raw = None
-        
 
+###############核心 ：获取输入 ##################################33
 
-    #     # -----------------------------------------------------------
-    #     # ⭐⭐⭐ 修改点 1: 获取 3D Landmark 图像
-    #     # -----------------------------------------------------------
-    #     # 从 batch 中提取 Dataset 生成好的 mixed_3d_landmarks
-    #     if 'mixed_3d_landmarks' in batch:
-    #         landmarks_img = batch['mixed_3d_landmarks'].to(self.device, memory_format=torch.contiguous_format).float()
-    #     else:
-    #         landmarks_img = None
-    #         if hasattr(self, 'landmark_encoder'):
-    #             print("Warning: landmark_encoder exists but 'mixed_3d_landmarks' not found in batch!")
-
-
-    #     if bs is not None:
-    #         x_w, x_l = x_w[:bs], x_l[:bs]
-    #         GT_original = GT_original[:bs]
-    #         inpaint, mask, reference = inpaint[:bs], mask[:bs], reference[:bs]
-    #         if ref_raw is not None:
-    #             ref_raw = ref_raw[:bs]  # ⭐ 修复：同时截断 ref_raw
-        
-    #     # 2. 编码共享条件
-    #     z_inpaint = self.get_first_stage_encoding(self.encode_first_stage(inpaint)).detach()
-    #     mask_resize = Resize([z_inpaint.shape[-1], z_inpaint.shape[-1]])(mask)
-
-
-    #     # -----------------------------------------------------------
-    #     # ⭐⭐⭐ 修改点 2: 编码 Landmark 并拼接到 13 通道
-    #     # -----------------------------------------------------------
-    #     # 如果启用了 encoder 且有数据
-    #     if hasattr(self, 'landmark_encoder') and landmarks_img is not None:
-    #         # 输入: [B, 3, 512, 512] -> 输出: [B, 4, 64, 64]
-    #         # 这里的 landmarks_img 已经是 Dataset 里生成的 Source ID + Target Pose 的混合引导图
-    #         landmark_latent = self.landmark_encoder(landmarks_img)
-    #     else:
-    #         landmark_latent = None
-        
-    #     # 3. 编码赢家和输家 (分别保持 [B, 9, 64, 64])
-    #     z_w = self.get_first_stage_encoding(self.encode_first_stage(x_w)).detach()
-    #     z_l = self.get_first_stage_encoding(self.encode_first_stage(x_l)).detach()
-        
-    #     z_new_w = torch.cat((z_w, z_inpaint, mask_resize), dim=1)  # [B, 9, 64, 64]
-    #     z_new_l = torch.cat((z_l, z_inpaint, mask_resize), dim=1)  # [B, 9, 64, 64]
-
-    #     # 4. 拼接逻辑 (9通道 vs 13通道)
-    #     if landmark_latent is not None:
-    #         # 拼接顺序: GT(4) + Inpaint(4) + Mask(1) + Landmark(4) = 13
-    #         z_new_w = torch.cat((z_w, z_inpaint, mask_resize, landmark_latent), dim=1)
-    #         z_new_l = torch.cat((z_l, z_inpaint, mask_resize, landmark_latent), dim=1)
-    #     else:
-    #         # 降级回 9 通道 (如果没有 encoder)
-    #         z_new_w = torch.cat((z_w, z_inpaint, mask_resize), dim=1)
-    #         z_new_l = torch.cat((z_l, z_inpaint, mask_resize), dim=1)
-        
-    #     # 4. 获取共享条件 [B, 1, 768]
-    #     if self.Landmark_cond or self.Landmark_loss_weight > 0:
-    #         landmarks = self.get_landmarks(GT_original)
-    #     else:
-    #         landmarks = None
-        
-    #     if self.model.conditioning_key is not None:
-    #         # ⭐ 修复：应该使用带mask的 reference（ref_imgs）作为条件
-    #         # 原因：只保留核心人脸区域，特征更纯净，减少干扰
-    #         # reference: B图像（带mask，只保留核心人脸）
-    #         # ref_raw: B图像（未mask，完整图像）- 仅用于ID损失
-    #         xc = reference  # ← 修复：使用带mask的版本
-    #         if not self.cond_stage_trainable or force_c_encode:
-    #             c_shared = self.conditioning_with_feat(xc, landmarks=landmarks).float()
-    #         else:
-    #             c_shared = xc
-    #     else:
-    #         c_shared = None
-        
-    #     # 5. ⭐ 输出：分别返回赢家、输家、条件（都是 B）
-    #     out = [z_new_w, z_new_l, c_shared]
-        
-    #     # 6. 可选返回值（都保持 B）
-    #     if return_first_stage_outputs:
-    #         xrec_w = self.decode_first_stage(z_w)
-    #         xrec_l = self.decode_first_stage(z_l)
-    #         out.extend([x_w, x_l, xrec_w, xrec_l])
-    #     if return_original_cond:
-    #         out.append(reference)
-    #     if get_mask:
-    #         out.append(mask)
-    #     if get_reference:
-    #         out.append(reference)
-    #     if get_landmarks_out:
-    #         out.append(landmarks)
-    #     if get_gt:
-    #         out.append(GT_original)
-    #     if get_inpaint:
-    #         out.append(inpaint)
-    #     if get_ref_raw:
-    #         out.append(ref_raw)  # 新增：返回未mask的参考图像
-        
-    #     return out
-    # ❌ 去掉 @torch.no_grad()，因为 LandmarkEncoder 需要传梯度！
-    # @torch.no_grad() 
     def get_input(self, batch, k, return_first_stage_outputs=False, force_c_encode=False,
                   cond_key=None, return_original_cond=False, bs=None, get_mask=False, 
                   get_reference=False, get_landmarks_out=False, get_gt=False, get_inpaint=False,
-                  get_ref_raw=False):
+                  get_ref_raw=False, get_gt_w=False,get_label=False):
     
         # 1. 获取所有输入
-        x_w = batch['GT_w'].to(self.device, memory_format=torch.contiguous_format).float()
-        x_l = batch['GT_l'].to(self.device, memory_format=torch.contiguous_format).float()
-        GT_original = batch['GT'].to(self.device, memory_format=torch.contiguous_format).float()
+        # ⭐ 兼容 SFT 和 DPO 模式：SFT 只有 'GT'，DPO 有 'GT_w' 和 'GT_l'
+        if 'GT_w' in batch:
+            x_w = batch['GT_w'].to(self.device, memory_format=torch.contiguous_format).float()
+            x_l = batch.get('GT_l', x_w).to(self.device, memory_format=torch.contiguous_format).float() if 'GT_l' in batch else None
+        else:
+            # SFT模式：只有一个GT样本
+            x_w = batch['GT'].to(self.device, memory_format=torch.contiguous_format).float()
+            x_l = None  # SFT没有lose样本
+        
+        # target_image: 用于条件编码的目标图像
+        if 'target_image' in batch:
+            target_image = batch['target_image'].to(self.device, memory_format=torch.contiguous_format).float()
+        else:
+            # 如果没有单独的target_image，使用GT
+            target_image = batch.get('GT', x_w).to(self.device, memory_format=torch.contiguous_format).float()
+        
         inpaint = batch['inpaint_image'].to(self.device, memory_format=torch.contiguous_format).float()
         mask = batch['inpaint_mask'].to(self.device, memory_format=torch.contiguous_format).float()
         reference = batch['ref_imgs'].to(self.device, memory_format=torch.contiguous_format).float()
-        
+        label = batch.get('label', None)  # 直接获取，不转换
         if 'ref_img_raw' in batch:
             ref_raw = batch['ref_img_raw'].to(self.device, memory_format=torch.contiguous_format).float()
         else:
@@ -1524,62 +1392,48 @@ class LatentDiffusion(DDPM):
             landmarks_img = batch['mixed_3d_landmarks'].to(self.device, memory_format=torch.contiguous_format).float()
         else:
             landmarks_img = None
-            # 只有在真的需要且缺失时才打印警告，避免刷屏
             if hasattr(self, 'landmark_encoder') and self.global_step < 10:
                 print("Warning: 'mixed_3d_landmarks' not found in batch!")
 
         # 2. 处理 Batch Slicing (bs)
         if bs is not None:
-            x_w = x_w[:bs]
-            x_l = x_l[:bs]
-            GT_original = GT_original[:bs]
-            inpaint = inpaint[:bs]
+            x_w = x_w[:bs] #for add noise and denosing
+            target_image = target_image[:bs] #for conditioning,clip and 2d landmark
+            inpaint = inpaint[:bs] 
             mask = mask[:bs]
             reference = reference[:bs]
             if ref_raw is not None:
                 ref_raw = ref_raw[:bs]
-            if landmarks_img is not None: # ⭐ 修复：别忘了切片这个！
+            if landmarks_img is not None: 
                 landmarks_img = landmarks_img[:bs]
-        
-        # 3. VAE 编码与 Mask 处理 (No Grad 区域)
-        # 只有 VAE 部分不需要梯度，可以使用上下文管理器
         with torch.no_grad():
             z_inpaint = self.get_first_stage_encoding(self.encode_first_stage(inpaint)).detach()
             mask_resize = Resize([z_inpaint.shape[-1], z_inpaint.shape[-1]])(mask)
             
             z_w = self.get_first_stage_encoding(self.encode_first_stage(x_w)).detach()
-            z_l = self.get_first_stage_encoding(self.encode_first_stage(x_l)).detach()
 
-        # 4. ⭐ Landmark 编码 (需要梯度！)
+        #need grad 
         landmark_latent = None
         if hasattr(self, 'landmark_encoder') and landmarks_img is not None:
-            # 正常计算
             landmark_latent = self.landmark_encoder(landmarks_img) # [B, 4, 64, 64]
-        
-        # ⭐ 兜底逻辑：如果算不出来（缺数据/没定义），必须补零！
         if landmark_latent is None:
-            # 必须生成和 z_w 设备、类型一致的全0张量
             landmark_latent = torch.zeros_like(z_w)
-            
-        # 5. 统一拼接 (始终是 13 通道)
         # z_w(4) + z_inpaint(4) + mask(1) + landmark(4) = 13
         z_new_w = torch.cat((z_w, z_inpaint, mask_resize, landmark_latent), dim=1)
-        z_new_l = torch.cat((z_l, z_inpaint, mask_resize, landmark_latent), dim=1)
 
-        # 6. 处理条件 Condition
-        # 只有 CLIP 部分不需要梯度
+
+        # 2d landmark 计算可以不需要梯度，但 conditioning_with_feat 需要梯度
         with torch.no_grad():
             if self.Landmark_cond or self.Landmark_loss_weight > 0:
-                landmarks = self.get_landmarks(GT_original)
+                landmarks = self.get_landmarks(target_image)
             else:
                 landmarks = None
-            
             if self.model.conditioning_key is not None:
                 xc = reference
+                #这里force_c_encode=False,所以不会编码
                 if not self.cond_stage_trainable or force_c_encode:
-                    # ⭐ 修复：参考ddpm_dpo.py，如果Target_CLIP_feat=True需要传入tar参数
                     if self.Target_CLIP_feat:
-                        c_shared = self.conditioning_with_feat(xc, landmarks=landmarks, tar=GT_original).float()
+                        c_shared = self.conditioning_with_feat(xc, landmarks=landmarks, tar=target_image).float()
                     else:
                         c_shared = self.conditioning_with_feat(xc, landmarks=landmarks).float()
                 else:
@@ -1587,15 +1441,12 @@ class LatentDiffusion(DDPM):
             else:
                 c_shared = None
         
-        # 7. 打包输出
-        out = [z_new_w, z_new_l, c_shared]
+        out = [z_new_w, c_shared] # c:[bs,3,224,224]
         
-        # 8. 可选返回
         if return_first_stage_outputs:
-            with torch.no_grad(): # 解码也不需要梯度
+            with torch.no_grad(): 
                 xrec_w = self.decode_first_stage(z_w)
-                xrec_l = self.decode_first_stage(z_l)
-            out.extend([x_w, x_l, xrec_w, xrec_l])
+            out.extend([x_w, xrec_w])
         if return_original_cond:
             out.append(reference)
         if get_mask:
@@ -1605,15 +1456,15 @@ class LatentDiffusion(DDPM):
         if get_landmarks_out:
             out.append(landmarks)
         if get_gt:
-            out.append(GT_original)
-        if get_inpaint:
-            out.append(inpaint)
+            out.append(target_image)  # target_image:[bs,3,512,512]
+        if get_gt_w:
+            out.append(x_w)  # x_w:[bs,3,512,512]
         if get_ref_raw:
-            out.append(ref_raw)
-        
+            out.append(ref_raw)  # ref_raw:[bs,3,224,224]
+        if get_label:
+            out.append(label)  # label:[bs,1]
         return out
   
-        
     @torch.no_grad()
     def decode_first_stage(self, z, predict_cids=False, force_not_quantize=False):
         if predict_cids:
@@ -1785,29 +1636,32 @@ class LatentDiffusion(DDPM):
         return loss
     
     def shared_step_face(self, batch, **kwargs):
-        # ⭐ 解包：z_w, z_l, c 都是 [B, ...]
-       # 修改后：添加 force_c_encode=True 和 get_ref_raw=True
+       # 修改后：正确区分 GT_tar（目标图像D）和 GT_w（真正的GT图像A）
         outputs = self.get_input(batch, self.first_stage_key, 
-                        force_c_encode=True,  # ← 强制编码条件
+                        force_c_encode=False,  # 默认值，与 ddpm.py 保持一致
                         get_landmarks_out=True, 
                         get_reference=True, 
-                        get_gt=True,
-                        get_ref_raw=True)  # ← 新增：获取未mask的参考图像
+                        get_gt=True,      # 获取GT_original（D图，目标图像）
+                        get_gt_w=True,    # 获取x_w（A图，真正的GT）
+                        get_ref_raw=True,
+                        get_label=True)   # 获取label（字符串列表） 
         
-        z_w = outputs[0]          # [B, 9, 64, 64] - 赢家潜变量
-        z_l = outputs[1]          # [B, 9, 64, 64] - 输家潜变量
-        c = outputs[2]            # [B, 1, 768] - 条件
-        reference = outputs[3]    # [B, 3, 224, 224] - 参考图像（已mask）
-        landmarks = outputs[4]    # landmarks（如果需要）
-        GT_w = outputs[5]         # [B, 3, H, W] - 赢家的 GT 图像
-        ref_raw = outputs[6]      # [B, 3, 224, 224] - 参考图像（未mask）⭐ 新增
+        z_w = outputs[0]          # [B, 13, 64, 64] - 基于A图编码的潜变量
+        c = outputs[1]            # [B, 1, 768] - 条件
+        reference = outputs[2]    # [B, 3, 224, 224] - B图（source，已mask）
+        landmarks = outputs[3]    # landmarks（如果需要）
+        GT_tar = outputs[4]       # [B, 3, H, W] - D图（目标图像，提供pose/背景）
+        GT_w = outputs[5]         # [B, 3, H, W] - A图（真正的GT，换脸后正确结果）
+        ref_raw = outputs[6]      # [B, 3, 224, 224] - B图（source，未mask）
+        label = outputs[7]        # List[str] - label（字符串列表：['sft', 'recon', ...]）
         
         # 调用 forward_face，传递所有需要的参数
-        loss = self.forward_face(z_w, z_l, c, 
+        loss = self.forward_face(z_w, c, 
                                landmarks=landmarks,
                                reference=reference,
-                               ref_raw=ref_raw,  # ← 新增
-                               GT_w=GT_w)
+                               ref_raw=ref_raw,
+                               GT_tar=GT_tar,  # ← D图，用于 conditioning_with_feat 的 tar 参数
+                               GT_w=GT_w,label=label)      # ← A图，真正的GT
         return loss
 
     def forward(self, x, c,landmarks=None, *args, **kwargs):
@@ -1834,124 +1688,47 @@ class LatentDiffusion(DDPM):
         else:  #x:[4,9,64,64] c:[4,1,768] x: img,inpaint_img,mask after first stage c:clip embedding
             return self.p_losses(x, c, t, *args, **kwargs)
     
-    # def forward_face(self, z_w, z_l, c, landmarks=None, reference=None, ref_raw=None, GT_w=None, 
-    #                 *args, **kwargs):
-    #     """
-    #     ⭐ 直接接收三个 B 批次的张量
-    #     z_w: [B, 9, 64, 64] - 赢家潜变量
-    #     z_l: [B, 9, 64, 64] - 输家潜变量
-    #     c: [B, 1, 768]      - 共享条件
-    #     reference: [B, 3, 224, 224] - 参考图像（已mask，用于条件）
-    #     ref_raw: [B, 3, 224, 224] - 参考图像（未mask，用于 ID 损失）⭐ 新增
-    #     GT_w: [B, 3, H, W] - 赢家的 GT 图像（用于感知损失）
-    #     """
-    #     # 1. 获取批次大小
-    #     B = z_w.shape[0]
-        
-    #     # 2. 采样共享时间步
-    #     t = torch.randint(0, self.num_timesteps, (B,), device=self.device).long()
-    #     if self.use_ori_loss:
-    #         return self.p_losses_face(z_w, c, t, *args, **kwargs)
-    #     # 3. ⭐ 传递额外参数到 p_losses_dpo
-    #     if self.use_sft_loss:
-    #         return self.p_loss_sft(z_w, z_l, c, t, 
-    #                             reference=reference,
-    #                             ref_raw=ref_raw,  # ← 新增
-    #                             GT_w=GT_w, 
-    #                             landmarks=landmarks,
-    #                             *args, **kwargs)    
-    #     else:
-    #         return self.p_losses_dpo(z_w, z_l, c, t, 
-    #                             reference=reference,
-    #                             ref_raw=ref_raw,  # ← 新增
-    #                             GT_w=GT_w, 
-    #                             landmarks=landmarks,
-    #                             *args, **kwargs)
-    def forward_face(self, z_w, z_l, c, landmarks=None, reference=None, ref_raw=None, GT_w=None, 
-                    *args, **kwargs):
-        """
-        ⭐ 全逻辑保留版 forward_face
-        z_w: [B, 13, 64, 64] (赢家输入)
-        z_l: [B, 13, 64, 64] (输家输入)
-        c:   [B, 1, 768]     (CLIP ID)
-        """
-        
-        # 1. 基础采样
-        # 对应原始: t = torch.randint(...)
-        B = z_w.shape[0]
-        t = torch.randint(0, self.num_timesteps, (B,), device=self.device).long()
-        
-        # 2. CFG 概率采样 (保留)
-        # 对应原始: self.u_cond_prop=random.uniform(0, 1)
+
+    def forward_face(self, z_w, c, landmarks=None, reference=None, ref_raw=None, GT_tar=None, 
+                    GT_w=None, *args, **kwargs):
+        t = torch.randint(0, self.num_timesteps, (z_w.shape[0],), device=self.device).long()
+        #一定概率置空条件
         self.u_cond_prop = random.uniform(0, 1)
+        if self.model.conditioning_key is not None:
+            assert c is not None
+            if self.cond_stage_trainable:
+                if hasattr(self, 'Target_CLIP_feat') and self.Target_CLIP_feat:
+                    # 这里传入GT_tar（D图，目标图像），而不是 GT_w（A图，真正的GT）
+                    c = self.conditioning_with_feat(c, landmarks=landmarks, tar=GT_tar)
+                else:
+                    c = self.conditioning_with_feat(c, landmarks=landmarks)
+            if hasattr(self, 'shorten_cond_schedule') and self.shorten_cond_schedule:
+                tc = self.cond_ids[t].to(self.device)
+                c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
 
-        # # 3. Condition 预处理 (保留原始的所有复杂判断)
-        # if self.model.conditioning_key is not None:
-        #     # 对应原始: assert c is not None...
-        #     assert c is not None
-        #     if self.cond_stage_trainable:
-        #         # 对应原始: if self.Target_CLIP_feat...
-        #         # 注意：原始的 GT_tar 对应现在的 GT_w
-        #         if hasattr(self, 'Target_CLIP_feat') and self.Target_CLIP_feat:
-        #             c = self.conditioning_with_feat(c, landmarks=landmarks, tar=GT_w)
-        #         else:
-        #             c = self.conditioning_with_feat(c, landmarks=landmarks)
-            
-        #     # 对应原始: if self.shorten_cond_schedule...
-        #     if hasattr(self, 'shorten_cond_schedule') and self.shorten_cond_schedule:
-        #         tc = self.cond_ids[t].to(self.device)
-        #         c = self.q_sample(x_start=c, t=tc, noise=torch.randn_like(c.float()))
-
-        # 4. 决定最终的 c_final (CFG 核心逻辑 - 完整保留)
         c_final = None
-
         if self.u_cond_prop < self.u_cond_percent and self.training:
-            # 【无条件分支】 - 完美复刻原始的三个 if/elif/else 分支
-            
             if (hasattr(self, 'land_mark_id_seperate_layers') and self.land_mark_id_seperate_layers) or \
                (hasattr(self, 'sep_head_att') and self.sep_head_att):
-                
-                # 分支 1: 拼接 learnable_vector 和 landmarks
-                conc = self.learnable_vector.repeat(B, 1, 1)
-                # 处理维度
+                conc = self.learnable_vector.repeat(z_w.shape[0], 1, 1)
                 lm_vec = landmarks.unsqueeze(1) if len(landmarks.shape) != 3 else landmarks                
                 c_final = torch.cat([conc, lm_vec], dim=-1)
-                
             elif hasattr(self, 'stack_feat') and self.stack_feat:
-                # 分支 2: stack 两个 learnable vectors
-                conc = self.learnable_vector.repeat(B, 1, 1)
-                coc2 = self.other_learnable_vector.repeat(B, 1, 1)
+                conc = self.learnable_vector.repeat(z_w.shape[0], 1, 1)
+                coc2 = self.other_learnable_vector.repeat(z_w.shape[0], 1, 1)
                 c_final = torch.cat([conc, coc2], dim=-2)
                 
             else:
-                # 分支 3: 默认情况，只用 learnable_vector
-                c_final = self.learnable_vector.repeat(B, 1, 1)
-        
+                c_final = self.learnable_vector.repeat(z_w.shape[0], 1, 1)   #实际无条件的分支
         else:
-            # 【有条件分支】
-            c_final = c
-
-        # 5. 分发到对应的 Loss 函数 (适配 SFT/DPO)
-        
-        # (可选) 兼容旧 loss
-        if hasattr(self, 'use_ori_loss') and self.use_ori_loss:
-            return self.p_losses_face(z_w, c_final, t, reference=reference, GT_tar=GT_w, landmarks=landmarks, *args, **kwargs)
-
-        # 新逻辑分发
+            c_final = c   #使用条件的分支
         if self.use_sft_loss:
-            return self.p_loss_sft(z_w, z_l, c_final, t, 
-                                reference=reference,
-                                ref_raw=ref_raw,
-                                GT_w=GT_w, 
-                                landmarks=landmarks,
+            return self.p_loss_sft(z_w, c_final, t, 
+                                reference=reference, #[bs,3,224,224]
+                                ref_raw=ref_raw, #[bs,3,224,224]
+                                GT_w=GT_w, #[bs,3,512,512]真正的GT,用来计算loss
+                                landmarks=landmarks,#[bs,1,768]
                                 *args, **kwargs)    
-        else:
-            return self.p_losses_dpo(z_w, z_l, c_final, t, 
-                                reference=reference,
-                                ref_raw=ref_raw,
-                                GT_w=GT_w, 
-                                landmarks=landmarks,
-                                *args, **kwargs)
 
     def _rescale_annotations(self, bboxes, crop_coordinates):  # TODO: move to dataset
         def rescale_bbox(bbox):
@@ -2124,7 +1901,7 @@ class LatentDiffusion(DDPM):
         if wandb.run is not None:
             wandb.log(loss_dict, commit=False)
         return loss, loss_dict
-    def p_loss_sft(self, z_start_w, z_start_l, cond, t, reference=None, ref_raw=None, GT_w=None, landmarks=None):
+    def p_loss_sft(self, z_start_w, cond, t, reference=None, ref_raw=None, GT_w=None, landmarks=None,label=None):
         """
         SFT损失函数 - 参考论文公式
         L = λ_id * L_id + λ_DM * L_DM + λ_rec * L_rec + λ_lpips * L_lpips
@@ -2135,87 +1912,54 @@ class LatentDiffusion(DDPM):
                    - z_inp (4:8): D图像的latent（提供姿态）
                    - m (8:9): mask
                    - enc(landmarks) (9:13): landmarks的编码
-        z_start_l: 不使用（为了兼容接口保留，SFT不需要loser）
-
         cond: 条件 (B, 1, 768) 
-        t: 时间步 (B,) - 论文中使用t=999进行one-step训练
+        t: 时间步 (B,)
         reference: B图像在像素空间（已mask，用于条件）
-        ref_raw: B图像在像素空间（未mask，用于ID损失）⭐ 新增
+        ref_raw: B图像在像素空间（没有mask)
         GT_w: A图像在像素空间（真正的GT，用于重构损失）
-        
-        换脸任务概念：
-        - A = 真正的GT（换脸后的正确结果）
-        - B = Source（提供身份）
-        - D = Target（提供姿态）
-        - 目标：学习 (D + B的条件) → A 的映射
-    
+        landmarks: landmarks的编码(B,1,768)
+        label: label(B,1)，recon or sft
         """
         loss_dict = {}
         prefix = 'train' if self.training else 'val'
         
-        
-        # ========== 1️⃣ Diffusion Loss (L_DM) - 主要损失 ==========
-        # 论文: L_DM = E[||ε - ε_θ(z_t, c, t)||_2]
-        
-        # 采样噪声
         noise = torch.randn_like(z_start_w[:, :4, :, :])
-        
-        # 对GT（A）加噪
         z0_A = z_start_w[:, :4, :, :]  # A图像的latent
         z_t = self.q_sample(x_start=z0_A, t=t, noise=noise)
-        
-        # 拼接输入（D）和mask
         z_noisy = torch.cat([z_t, z_start_w[:, 4:, :, :]], dim=1)  # (B, 13, 64, 64)
-        
-        # 模型预测噪声
         pred_noise = self.apply_model(z_noisy, t, cond)
         
-        # 计算Diffusion损失
-        loss_DM = self.get_loss(pred_noise, noise, mean=True)
-        loss_dict[f'{prefix}/loss_DM'] = loss_DM
+        loss_DM = self.get_loss(pred_noise, noise, mean=False)  # [B, 4, 64, 64]
+        loss_dict[f'{prefix}/loss_DM'] = loss_DM.mean()
+        loss_diffusion=loss_DM.mean()
+        loss_total = self.aux_diffusion_weight * loss_diffusion
         
-        # 主损失（根据配置的权重）
-        loss_total = self.aux_diffusion_weight * loss_DM
-        
-        # 采样一个新的 t_new（固定为最大时间步，用于重建损失计算）
-        # 从最大噪声状态开始去噪，测试完整的去噪能力
-        t_new = torch.randint(
-            self.num_timesteps - 1, 
-            self.num_timesteps, 
-            (z_start_w.shape[0],), 
-            device=self.device
-        ).long()
-        
-        # 使用 t_new 重新加噪（从最大噪声开始）
+        t_new = torch.randint(self.num_timesteps - 1, self.num_timesteps, (z_start_w.shape[0],), device=self.device).long()
         z_t_new = self.q_sample(x_start=z0_A, t=t_new, noise=noise)
-        
-        # ========== 2️⃣ ID Loss (L_id) + Reconstruction Loss (L_rec) + LPIPS Loss ==========
+
+        #如果需要计算ID、重构、感知损失
         if (self.aux_id_loss_weight > 0 or self.aux_lpips_loss_weight > 0 or self.aux_reconstruct_weight > 0):
-            # ⭐ 根据配置选择单步预测或多步去噪
             ddim_steps = self.aux_reconstruct_ddim_steps
             
             if ddim_steps == 1:
                 pred_x0 = self.predict_start_from_noise(z_t, t, pred_noise)
                 x_pred = self.differentiable_decode_first_stage(pred_x0)
             else:
-                # 使用多步DDIM去噪获取x0
-                # Step 1: 准备输入（使用 z_t_new，从最大时间步开始去噪）
-                z_noisy_rec = torch.cat((z_t_new, z_start_w[:, 4:, :, :]), dim=1)
+                z_noisy_rec = torch.cat((z_t_new, z_start_w[:, 4:, :, :]), dim=1)#重新加噪之后，拼接
                 
-                # Step 2: DDIM 多步去噪重构
                 if hasattr(self, 'sampler'):
                     n_samples = z_noisy_rec.shape[0]
                     shape = (4, 64, 64)
                     ddim_eta = 0.0
+                    scale=5
                     
-                    # 使用当前条件进行重构（从 t_new 开始去噪）
                     samples_ddim, sample_intermediates = self.sampler.sample_train(
                         S=ddim_steps,
                         conditioning=cond,
                         batch_size=n_samples,
                         shape=shape,
                         verbose=False,
-                        unconditional_guidance_scale=5,
+                        unconditional_guidance_scale=scale,
                         unconditional_conditioning=None,
                         eta=ddim_eta,
                         x_T=z_noisy_rec,
@@ -2223,30 +1967,22 @@ class LatentDiffusion(DDPM):
                         test_model_kwargs=None
                     )
                     
-                    # Step 3: 多步去噪
                     other_pred_x_0 = sample_intermediates['pred_x0']
                     decoded_pred_x_0 = []
                     for i in range(len(other_pred_x_0)):
                         decoded = self.differentiable_decode_first_stage(other_pred_x_0[i])
                         decoded_pred_x_0.append(decoded)
                     
-                    # 用最后一步作为主要输出（用于重构损失）
                     x_pred = decoded_pred_x_0[-1]
                     
                 else:
-                    # 如果没有sampler，回退到单步预测
-                    print("警告: 未找到sampler，回退到单步预测")
                     pred_x0 = self.predict_start_from_noise(z_t, t, pred_noise)
                     x_pred = self.differentiable_decode_first_stage(pred_x0)
-                    decoded_pred_x_0 = [x_pred]  # 只有一个步骤
+                    decoded_pred_x_0 = [x_pred]  
             
-            # ⭐ 应用（ID、重构、感知损失
-            # 2.1 ID Loss - L_id = 1 - cos(e_ID_A1, e_ID_Ã)
-            # ⭐ 修改：与原始代码一致，对所有中间步骤计算并平均
+            # ⭐ 应用ID、重构、感知损失
             if self.aux_id_loss_weight > 0 and hasattr(self, 'face_ID_model'):
-                # ⭐ 直接使用已mask的参考图像 reference（数据加载时已处理）
                 if reference is not None:
-                    # 准备Source图像B（从CLIP归一化转为标准归一化）
                     source_normalized = un_norm_clip(reference)
                     source_normalized = TF.normalize(source_normalized,
                                                     mean=[0.5, 0.5, 0.5],
@@ -2260,61 +1996,82 @@ class LatentDiffusion(DDPM):
                 masks = 1 - TF.resize(z_start_w[:, 8, :, :],
                                      (decoded_pred_x_0[0].shape[2], decoded_pred_x_0[0].shape[3]))
                 
-                # ⭐ 只用最后一步计算ID损失（节省显存和计算）
-                # 如果想要所有步骤，在显存充足时再改回来
-                x_pred_final = decoded_pred_x_0[-1]  # 只取最后一步
-                x_pred_masked = x_pred_final * masks.unsqueeze(1)
-                
-                # 计算ID损失（余弦相似度损失）
-                loss_id, sim_imp, _ = self.face_ID_model(
-                    x_pred_masked, source_normalized, clip_img=False
-                )
-                
-                # ⭐ 应用时间步权重
-                loss_total += self.aux_id_loss_weight * loss_id 
-                loss_dict[f'{prefix}/loss_id'] = loss_id
-                loss_dict[f'{prefix}/sim_imp'] = sim_imp
-            
-            # 2.2 L2 Reconstruction Loss - L_rec = ||A - Ã||_2^2
-            # 只用最后一步计算重构损失
-            if self.aux_reconstruct_weight > 0 and GT_w is not None:
-                # 计算L2重构损失
-                loss_rec_l2 = self.get_loss(x_pred, GT_w, mean=True)
-                
-                # ⭐ 应用时间步权重
-                loss_total += self.aux_reconstruct_weight * loss_rec_l2
-                loss_dict[f'{prefix}/loss_rec_l2'] = loss_rec_l2
-            
-            # 2.3 ⭐ LPIPS Perceptual Loss - L_lpips = LPIPS(A, Ã)
-            # ⭐ 只用最后一步（节省显存），多尺度
-            if self.aux_lpips_loss_weight > 0 and GT_w is not None and hasattr(self, 'lpips_loss'):
-                if self.aux_lpips_multiscale:
-                    # 只用最后一步 × 多尺度
-                    loss_lpips = 0
-                    for scale_idx in range(3):  # 3个尺度：512, 256, 128
-                        scale_size = 512 // (2 ** scale_idx)
-                        loss_lpips_scale = self.lpips_loss(
-                            F.adaptive_avg_pool2d(x_pred, (scale_size, scale_size)),
-                            F.adaptive_avg_pool2d(GT_w, (scale_size, scale_size))
-                        ).mean()
-                        loss_lpips += loss_lpips_scale
-                        loss_dict[f'{prefix}/loss_lpips_scale_{scale_idx}'] = loss_lpips_scale
+                if self.aux_reconstruct_per_step:
+                    # ⭐ 参考ddpm.py：对每一步都计算ID损失
+                    ID_losses = []
+                    x_samples_ddim_masked = [x_pred_step * masks.unsqueeze(1) for x_pred_step in decoded_pred_x_0]
+                    for step, x_pred_masked in enumerate(x_samples_ddim_masked):
+                        loss_id_step, sim_imp, _ = self.face_ID_model(
+                            x_pred_masked, source_normalized, clip_img=False
+                        )
+                        ID_losses.append(loss_id_step)
+                        loss_dict[f'{prefix}/ID_loss_{step}'] = loss_id_step
+                    
+                    loss_id = torch.mean(torch.stack(ID_losses))
+                    loss_total += self.aux_id_loss_weight * loss_id
+                    loss_dict[f'{prefix}/loss_id'] = loss_id
+                    loss_dict[f'{prefix}/sim_imp'] = sim_imp
                 else:
-                    # 单尺度：只用最后一步
-                    loss_lpips = self.lpips_loss(x_pred, GT_w).mean()
+                    # 只计算最后一步
+                    x_pred_final = decoded_pred_x_0[-1]  # 只取最后一步
+                    x_pred_masked = x_pred_final * masks.unsqueeze(1)
+                    
+                    # 计算ID损失（余弦相似度损失）
+                    loss_id, sim_imp, _ = self.face_ID_model(
+                        x_pred_masked, source_normalized, clip_img=False
+                    )
+                    
+                    loss_total += self.aux_id_loss_weight * loss_id 
+                    loss_dict[f'{prefix}/loss_id'] = loss_id
+                    loss_dict[f'{prefix}/sim_imp'] = sim_imp
+            
+            if self.aux_reconstruct_weight > 0 and GT_w is not None:
+                if self.aux_reconstruct_per_step:
+                    # ⭐ 参考ddpm.py：对每一步都计算重构损失
+                    rec_losses = []
+                    for step, x_pred_step in enumerate(decoded_pred_x_0):
+                        loss_rec_l2_step = self.get_loss(x_pred_step, GT_w, mean=True)
+                        rec_losses.append(loss_rec_l2_step)
+                        loss_dict[f'{prefix}/loss_rec_l2_{step}'] = loss_rec_l2_step
+                    
+                    loss_rec_l2 = torch.mean(torch.stack(rec_losses))
+                    loss_total += self.aux_reconstruct_weight * loss_rec_l2
+                    loss_dict[f'{prefix}/loss_rec_l2'] = loss_rec_l2
+                else:
+                    # 只计算最后一步
+                    loss_rec_l2 = self.get_loss(x_pred, GT_w, mean=True)
+                    loss_total += self.aux_reconstruct_weight * loss_rec_l2
+                    loss_dict[f'{prefix}/loss_rec_l2'] = loss_rec_l2
+            
+            if self.aux_lpips_loss_weight > 0 and GT_w is not None and hasattr(self, 'lpips_loss'):
+                loss_lpips = 0
+                if self.aux_reconstruct_per_step:
+                    # ⭐ 参考ddpm.py：对每一步都计算LPIPS损失（固定多尺度，总是3个尺度）
+                    for j in range(len(decoded_pred_x_0)):
+                        for i in range(3):
+                            loss_lpips_1 = self.lpips_loss(
+                                F.adaptive_avg_pool2d(decoded_pred_x_0[j], (512//2**i, 512//2**i)), 
+                                F.adaptive_avg_pool2d(GT_w, (512//2**i, 512//2**i))
+                            )
+                            loss_dict.update({f'{prefix}/loss_lpips_{j}_{i}': loss_lpips_1})
+                            loss_lpips += loss_lpips_1
+                else:
+                    # 只计算最后一步，固定多尺度（总是3个尺度）
+                    for i in range(3):
+                        loss_lpips_1 = self.lpips_loss(
+                            F.adaptive_avg_pool2d(x_pred, (512//2**i, 512//2**i)), 
+                            F.adaptive_avg_pool2d(GT_w, (512//2**i, 512//2**i))
+                        )
+                        loss_dict.update({f'{prefix}/loss_lpips_0_{i}': loss_lpips_1})
+                        loss_lpips += loss_lpips_1
                 
-                # ⭐ 应用时间步权重
-                loss_total += self.aux_lpips_loss_weight * loss_lpips 
-                loss_dict[f'{prefix}/loss_lpips'] = loss_lpips
+                loss_total += self.aux_lpips_loss_weight * loss_lpips
+                loss_dict.update({f'{prefix}/loss_lpips': loss_lpips})
                 
-        
-        # ========== 总损失 ==========
-        # 论文: L = λ_id * L_id + λ_DM * L_DM + λ_rec * L_rec + λ_lpips * L_lpips
-        # ⭐ 新增：时间步权重机制，当t小时给予更大权重
         loss_dict[f'{prefix}/loss'] = loss_total
         
         if wandb.run is not None:
-            wandb.log(loss_dict, commit=False)
+            wandb.log(loss_dict)
         
         return loss_total, loss_dict
 
@@ -2478,187 +2235,7 @@ class LatentDiffusion(DDPM):
         
         return loss, loss_dict
 
-    def p_losses_dpo(self, z_start_w, z_start_l, cond, t, reference=None, ref_raw=None, GT_w=None, landmarks=None):
-        """
-        计算 Diffusion DPO 损失 + 可选的辅助损失
-
-        参数:
-        z_start_w: "赢家" 潜变量 (B, 9, 64, 64) - [z0_w, z_inp, m]，A
-        z_start_l: "输家" 潜变量 (B, 9, 64, 64) - [z0_l, z_inp, m],E
-        cond: 共享条件 (B, 1, 768) - (来自 ref_imgs)
-        t: 共享时间步 (B,)
-        reference: 参考图像（已mask，用于条件）
-        ref_raw: 参考图像（未mask，用于 ID 损失）⭐ 新增
-        GT_w:实际是B,伪造target
-        landmarks: B的landmarks
-        """
-        # (D1) 修正：分别采样独立噪声 epsilon_w 和 epsilon_l
-        noise_w = torch.randn_like(z_start_w[:, :4, :, :])
-        noise_l = torch.randn_like(z_start_l[:, :4, :, :])
-
-        # 赢家：对 z0_w 加噪
-        z_t_w = self.q_sample(x_start=z_start_w[:, :4, :, :], t=t, noise=noise_w)
-        z_noisy_w = torch.cat((z_t_w, z_start_w[:, 4:, :, :]), dim=1) 
-
-        # 输家：对 z0_l 加噪
-        #如果dpo权重不等于0
-        z_t_l = self.q_sample(x_start=z_start_l[:, :4, :, :], t=t, noise=noise_l)
-        z_noisy_l = torch.cat((z_t_l, z_start_l[:, 4:, :, :]), dim=1) 
-        
-        loss_dict = {}
-        prefix = 'train' if self.training else 'val'
-
-        # (D2) 获取策略模型(policy)和参考模型(ref)的噪声预测
-        c_dict = {__conditioning_keys__[self.model.conditioning_key]: [cond]}
-        
-        pred_noise_policy_w = self.apply_model(z_noisy_w, t, cond)
-        pred_noise_policy_l = self.apply_model(z_noisy_l, t, cond)
-
-        # ⭐ 安全检查：确保参考模型存在（DPO模式才需要）
-        if self.model_ref is None:
-            raise RuntimeError("参考模型未初始化！p_losses_dpo 需要参考模型，请检查配置。")
-        
-        with torch.no_grad():
-            pred_noise_ref_w = self.model_ref(z_noisy_w, t, **c_dict)
-            pred_noise_ref_l = self.model_ref(z_noisy_l, t, **c_dict)
-
-        
-        # (D3) 修正：计算 Loss 时，target 必须对应各自的 noise
-        # 赢家比较 pred_w 和 noise_w
-        loss_policy_w = self.get_loss(pred_noise_policy_w, noise_w, mean=False).mean(dim=[1, 2, 3])
-        loss_ref_w    = self.get_loss(pred_noise_ref_w,    noise_w, mean=False).mean(dim=[1, 2, 3])
-        
-        # 输家比较 pred_l 和 noise_l
-        loss_policy_l = self.get_loss(pred_noise_policy_l, noise_l, mean=False).mean(dim=[1, 2, 3])
-        loss_ref_l    = self.get_loss(pred_noise_ref_l,    noise_l, mean=False).mean(dim=[1, 2, 3])
-        # (D4) 构建优势项 A_theta_ref(t)
-        A_theta_ref = (loss_policy_w - loss_policy_l) - (loss_ref_w - loss_ref_l).detach()
-        
-        # (D5) 最终 Diffusion-DPO 损失
-        logits = -self.dpo_beta * A_theta_ref
-        loss_dpo = -torch.nn.functional.logsigmoid(logits).mean()
-        
-        # 记录 DPO 损失
-        loss_dict.update({f'{prefix}/loss_dpo': loss_dpo})
-        loss_dict.update({f'{prefix}/A_theta_ref_mean': A_theta_ref.mean()})
-        loss_dict.update({f'{prefix}/loss_policy_w_mean': loss_policy_w.mean()})
-        loss_dict.update({f'{prefix}/loss_policy_l_mean': loss_policy_l.mean()})
-        
-        # ========== 辅助损失部分 ==========
-        loss_aux_total = 0.0
-        
-        if self.use_auxiliary_losses:
-            # 1️⃣ 扩散重构损失（对赢样本）
-            if self.aux_diffusion_weight > 0:
-                loss_diffusion = self.get_loss(pred_noise_policy_w, noise_w, mean=True)
-                loss_aux_total += self.aux_diffusion_weight * loss_diffusion
-                loss_dict.update({f'{prefix}/loss_aux_diffusion': loss_diffusion})
-            
-            # 2️⃣ & 3️⃣ ID 损失 + 感知损失（需要多步 DDIM 重构）
-            if (self.aux_id_loss_weight > 0 or self.aux_lpips_loss_weight > 0) and hasattr(self, 'sampler'):
-                # 参考原始 REFace 的重构流程
-                # Step 1: 对赢样本加最大噪声
-                t_new = torch.randint(self.num_timesteps-1, self.num_timesteps, 
-                                     (z_start_w.shape[0],), device=self.device).long()
-                z_noisy_rec = self.q_sample(x_start=z_start_w[:, :4, :, :], t=t_new, noise=noise_w)
-                z_noisy_rec = torch.cat((z_noisy_rec, z_start_w[:, 4:, :, :]), dim=1)
-                
-                # Step 2: DDIM 多步去噪重构
-                ddim_steps = self.aux_reconstruct_ddim_steps
-                n_samples = z_noisy_rec.shape[0]
-                shape = (4, 64, 64)
-                ddim_eta = 0.0
-                
-                # 使用当前条件进行重构（不需要 flip）
-                samples_ddim, sample_intermediates = self.sampler.sample_train(
-                    S=ddim_steps,
-                    conditioning=cond,
-                    batch_size=n_samples,
-                    shape=shape,
-                    verbose=False,
-                    unconditional_guidance_scale=5,
-                    unconditional_conditioning=None,
-                    eta=ddim_eta,
-                    x_T=z_noisy_rec,
-                    t=t_new,
-                    test_model_kwargs=None
-                )
-                
-                # Step 3: 获取每步的 pred_x0 并解码到图像空间
-                other_pred_x_0 = sample_intermediates['pred_x0']
-                decoded_pred_x_0 = []
-                for i in range(len(other_pred_x_0)):
-                    decoded = self.differentiable_decode_first_stage(other_pred_x_0[i])
-                    decoded_pred_x_0.append(decoded)
-                
-                # Step 4: 计算 ID 损失
-                if self.aux_id_loss_weight > 0 and hasattr(self, 'face_ID_model'):
-                    # ⭐ 优先使用未mask的参考图像 ref_raw
-                    source_for_id = ref_raw if ref_raw is not None else reference
-                    
-                    if source_for_id is not None:
-                        # 准备参考图像（从CLIP归一化转为标准归一化）
-                        reference_normalized = un_norm_clip(source_for_id)
-                        reference_normalized = TF.normalize(reference_normalized, 
-                                                           mean=[0.5, 0.5, 0.5], 
-                                                           std=[0.5, 0.5, 0.5])
-                    else:
-                        reference_normalized = None
-                
-                if self.aux_id_loss_weight > 0 and reference_normalized is not None and hasattr(self, 'face_ID_model'):
-                    
-                    # 准备 mask
-                    masks = 1 - TF.resize(z_start_w[:, 8, :, :], 
-                                         (decoded_pred_x_0[0].shape[2], decoded_pred_x_0[0].shape[3]))
-                    
-                    # 对每步的重构结果计算 ID 损失
-                    ID_Losses = []
-                    for step, x_pred in enumerate(decoded_pred_x_0):
-                        x_pred_masked = x_pred * masks.unsqueeze(1)
-                        ID_loss_step, sim_imp, _ = self.face_ID_model(
-                            x_pred_masked, reference_normalized, clip_img=False
-                        )
-                        ID_Losses.append(ID_loss_step)
-                        loss_dict.update({f'{prefix}/loss_aux_id_step_{step}': ID_loss_step})
-                    
-                    # 平均所有步的 ID 损失
-                    ID_loss = torch.mean(torch.stack(ID_Losses))
-                    loss_aux_total += self.aux_id_loss_weight * ID_loss
-                    
-                    loss_dict.update({f'{prefix}/loss_aux_id': ID_loss})
-                    loss_dict.update({f'{prefix}/aux_sim_imp': sim_imp})
-                
-                # Step 5: 计算感知损失（LPIPS）
-                if self.aux_lpips_loss_weight > 0 and GT_w is not None and hasattr(self, 'lpips_loss'):
-                    loss_lpips = 0
-                    # 对每步的重构结果和每个尺度都计算 LPIPS
-                    for step, x_pred in enumerate(decoded_pred_x_0):
-                        for scale_idx in range(3):
-                            scale_size = 512 // (2 ** scale_idx)
-                            loss_lpips_scale = self.lpips_loss(
-                                F.adaptive_avg_pool2d(x_pred, (scale_size, scale_size)),
-                                F.adaptive_avg_pool2d(GT_w, (scale_size, scale_size))
-                            )
-                            loss_lpips += loss_lpips_scale
-                            loss_dict.update({
-                                f'{prefix}/loss_aux_lpips_step_{step}_scale_{scale_idx}': loss_lpips_scale
-                            })
-                    
-                    loss_aux_total += self.aux_lpips_loss_weight * loss_lpips
-                    loss_dict.update({f'{prefix}/loss_aux_lpips': loss_lpips})
-            
-            # 记录总辅助损失
-            if loss_aux_total > 0:
-                loss_dict.update({f'{prefix}/loss_aux_total': loss_aux_total})
-        
-        # ========== 总损失 ==========
-        loss = self.dpo_loss_weight * loss_dpo + loss_aux_total
-        loss_dict.update({f'{prefix}/loss': loss})
-        
-        # ⭐ 修复阻塞问题：commit=False，避免每个batch都等待上传
-        if wandb.run is not None:
-            wandb.log(loss_dict, commit=False)
-        return loss, loss_dict
+   
 
 
     def p_mean_variance(self, x, c, t, clip_denoised: bool, return_codebook_ids=False, quantize_denoised=False,
@@ -2879,321 +2456,237 @@ class LatentDiffusion(DDPM):
     @rank_zero_only
     @torch.no_grad()
     def run_test_during_training(self):
-        """训练过程中进行测试：生成样本并计算指标"""
+        """
+        训练过程中进行测试：直接使用配置文件中定义的test数据集进行推理
+        配置路径：configs/train_sft_13ch.yaml -> data.test
+        数据集：./dataset/test_bench_ffhq.json
+        """
         if not hasattr(self, 'test_during_training') or not self.test_during_training:
             return
         
         print(f"\n{'='*60}")
-        print(f"[Test During Training] Step {self.global_step}: Starting test evaluation")
+        print(f"[Test] Step {self.global_step}: Starting inference on test dataset")
         print(f"{'='*60}\n")
         
         try:
-            # 1. 从配置中获取测试数据集配置（参考inference_test_bench.py）
+            # ⭐ 简化：直接从datamodule获取test_dataloader
             if not hasattr(self.trainer, 'datamodule'):
-                print("[Test] No datamodule available, skipping test")
+                print("[Test] ERROR: No datamodule available")
                 return
             
-            # 从datamodule获取配置
+            # 获取test dataloader（配置文件中的 data.test）
             test_dataloader = None
             try:
-                # 尝试从datamodule的dataset_configs获取测试配置
-                if hasattr(self.trainer.datamodule, 'dataset_configs') and 'test' in self.trainer.datamodule.dataset_configs:
-                    test_config = self.trainer.datamodule.dataset_configs['test']
-                    test_args = test_config.get('params', {})
-                    
-                    # 优先使用self.test_dataset_name参数（参考inference_test_bench.py的opt.dataset逻辑）
-                    # 如果未设置，则从配置文件的target中提取
-                    dataset_name = getattr(self, 'test_dataset_name', None)
-                    if dataset_name is None or dataset_name == "" or dataset_name == "1":
-                        # 从配置文件target中提取数据集名称
-                        config_target = test_config.get('target', '').split('.')[-1]  # 例如: CelebAdataset
-                        if 'CelebAdataset' in config_target:
-                            dataset_name = 'CelebA'
-                        elif 'FFHQdataset' in config_target:
-                            dataset_name = 'FFHQ'
-                        elif 'FFdataset' in config_target or 'FF++' in config_target:
-                            dataset_name = 'FF++'
-                        else:
-                            dataset_name = 'CelebA'  # 默认使用CelebA
-                    
-                    # 创建测试数据集（参考inference_test_bench.py第394-402行）
-                    from ldm.data.test_bench_dataset import CelebAdataset, FFHQdataset, FFdataset
-                    
-                    if dataset_name == 'CelebA':
-                        test_dataset = CelebAdataset(split='test', **test_args)
-                    elif dataset_name == 'FFHQ':
-                        test_dataset = FFHQdataset(split='test', **test_args)
-                    elif dataset_name == 'FF++':
-                        test_dataset = FFdataset(split='test', **test_args)
-                    else:
-                        print(f"[Test] Unknown test dataset name: {dataset_name}, using FFHQ as default")
-                        test_dataset = FFHQdataset(split='test', **test_args)
-                    
-                    if test_dataset is not None:
-                        # ⭐ 限制数据集大小为test_num_samples，避免加载多余数据
-                        num_samples = getattr(self, 'test_num_samples', 200)
-                        original_size = len(test_dataset)
-                        if original_size > num_samples:
-                            test_dataset = torch.utils.data.Subset(test_dataset, range(num_samples))
-                            print(f"[Test] Limited dataset to {num_samples} samples (original: {original_size} samples)")
-                        else:
-                            print(f"[Test] Using full test dataset: {original_size} samples")
-                        
-                        # 创建测试dataloader
-                        test_dataloader = torch.utils.data.DataLoader(
-                            test_dataset,
-                            batch_size=self.test_batch_size,
-                            num_workers=4,
-                            pin_memory=True,
-                            shuffle=False,
-                            drop_last=False
-                        )
-                        print(f"[Test] Created test dataset: {dataset_name}")
-                
+                print("[Test] Loading test dataloader from config (data.test)...")
+                test_dataloader = self.trainer.datamodule.test_dataloader()
+                dataset_size = len(test_dataloader.dataset)
+                print(f"[Test] ✓ Loaded test dataset: {dataset_size} samples")
+                print(f"[Test]   - Batch size: {test_dataloader.batch_size}")
+                print(f"[Test]   - Num batches: {len(test_dataloader)}")
             except Exception as e:
-                print(f"[Test] Failed to create test dataset: {e}")
+                print(f"[Test] ERROR: Failed to load test dataloader: {e}")
+                import traceback
+                traceback.print_exc()
+                return
             
-            # 如果没有成功创建test_dataloader，使用validation数据集
             if test_dataloader is None:
-                print("[Test] Using validation dataset instead")
-                try:
-                    test_dataloader = self.trainer.datamodule.val_dataloader()
-                    print(f"[Test] Using validation dataloader")
-                except Exception as e:
-                    print(f"[Test] Failed to get validation dataloader: {e}, skipping test")
-                    return
+                print("[Test] ERROR: test_dataloader is None")
+                return
             
-            # 3. 创建临时输出目录（在--logdir/tmp下）
-            # 获取logdir（优先使用trainer.logdir，这是--logdir参数指定的目录）
+            # 获取输出目录
             if hasattr(self.trainer, 'logdir'):
                 logdir = self.trainer.logdir
             elif hasattr(self.trainer, 'logger') and hasattr(self.trainer.logger, 'log_dir'):
-                # 如果没有logdir，回退到logger.log_dir
                 logdir = self.trainer.logger.log_dir
             else:
                 logdir = "logs"
             
-            # 创建tmp目录
+            # 创建测试输出目录
             tmp_dir = os.path.join(logdir, "tmp")
-            os.makedirs(tmp_dir, exist_ok=True)
-            
-            # 测试样本保存在 tmp/test_samples_step_{step}/
-            test_output_dir = os.path.join(tmp_dir, f"test_samples_step_{self.global_step}")
+            test_output_dir = os.path.join(tmp_dir, f"test_step_{self.global_step}")
             os.makedirs(test_output_dir, exist_ok=True)
+            print(f"[Test] Output directory: {test_output_dir}")
             
-            # 4. 生成样本
+            # 开始推理
             num_samples = getattr(self, 'test_num_samples', 200)
-            print(f"[Test] Generating {num_samples} samples...")
+            test_ddim_steps = getattr(self, 'test_ddim_steps', 50)
+            test_scale = getattr(self, 'test_guidance_scale', 3.5)
+            
+            print(f"[Test] Inference settings:")
+            print(f"  - Num samples: {num_samples}")
+            print(f"  - DDIM steps: {test_ddim_steps}")
+            print(f"  - Guidance scale: {test_scale}")
             
             samples_generated = 0
             
+            # ⭐ 简化：直接使用EMA模型进行推理
             with self.ema_scope("Testing"):
-                for batch_idx, batch_data in enumerate(test_dataloader):
+                from ldm.models.diffusion.ddim import DDIMSampler
+                sampler = DDIMSampler(self)
+                
+                for batch_idx, batch in enumerate(test_dataloader):
                     if samples_generated >= num_samples:
                         break
                     
-                    # ⭐ 13通道模型：测试数据集使用 SFTFaceDataset_13ch，返回字典格式
-                    # 参考 test/infer.py 第449-451行的处理方式
-                    if isinstance(batch_data, dict):
-                        # SFTFaceDataset_13ch 返回的字典格式（参考 sft_dataset_13ch.py 第1139-1172行）
-                        batch = batch_data
+                    # ⭐ 调试：打印batch格式
+                    if batch_idx == 0:
+                        if isinstance(batch, dict):
+                            print(f"[Test] Batch is dict with keys: {list(batch.keys())}")
+                        elif isinstance(batch, (list, tuple)):
+                            print(f"[Test] Batch is {type(batch).__name__} with {len(batch)} elements")
+                            print(f"[Test] Element types: {[type(x).__name__ for x in batch]}")
+                        else:
+                            print(f"[Test] Batch type: {type(batch).__name__}")
+                    
+                    # ⭐ 兼容多种数据格式
+                    if isinstance(batch, dict):
+                        # SFTFaceDataset格式
                         for key in batch:
                             if isinstance(batch[key], torch.Tensor):
                                 batch[key] = batch[key].to(self.device)
                         
-                        # 生成 segment_id（用于保存文件名）
-                        batch_size = batch['GT'].shape[0]
-                        segment_id_batch = [f"{samples_generated + i:06d}" for i in range(batch_size)]
-                    
-                    elif isinstance(batch_data, (list, tuple)) and len(batch_data) >= 3:
-                        # 兼容旧的测试数据集格式: (test_batch, prior, test_model_kwargs, segment_id_batch)
-                        test_batch = batch_data[0].to(self.device)  # [B, 3, H, W] - 目标图像
-                        prior = batch_data[1].to(self.device) if len(batch_data) > 1 and isinstance(batch_data[1], torch.Tensor) else test_batch
-                        test_model_kwargs = batch_data[2] if isinstance(batch_data[2], dict) else {}
-                        segment_id_batch = batch_data[3] if len(batch_data) > 3 else [f"{samples_generated + i:06d}" for i in range(test_batch.shape[0])]
+                        # ⭐ 键名说明（新版SFTFaceDataset）：
+                        # - 'target_image': 目标图像（提供姿态和背景）- 这是推理的真正输入
+                        # - 'GT_w': 换脸后的正确结果（用于监督和对比）
+                        # - 'GT': 旧版数据集的键名
                         
-                        # 从test_model_kwargs中提取数据
-                        inpaint_image = test_model_kwargs.get('inpaint_image', test_batch)
-                        if isinstance(inpaint_image, torch.Tensor):
-                            inpaint_image = inpaint_image.to(self.device)
+                        # 获取target图像（用于推理）
+                        if 'target_image' in batch:
+                            target = batch['target_image']
+                        elif 'GT' in batch:
+                            target = batch['GT']
+                        elif 'GT_w' in batch:
+                            # 如果没有target_image，回退到GT_w
+                            target = batch['GT_w']
                         else:
-                            inpaint_image = test_batch
-                            
-                        inpaint_mask = test_model_kwargs.get('inpaint_mask', torch.ones_like(test_batch[:, :1]))
-                        if isinstance(inpaint_mask, torch.Tensor):
-                            inpaint_mask = inpaint_mask.to(self.device)
-                        else:
-                            inpaint_mask = torch.ones_like(test_batch[:, :1])
-                            
-                        ref_imgs = test_model_kwargs.get('ref_imgs', test_batch)
-                        if isinstance(ref_imgs, torch.Tensor):
-                            ref_imgs = ref_imgs.to(self.device)
-                            if ref_imgs.dim() == 4 and ref_imgs.shape[1] == 1:
-                                ref_imgs = ref_imgs.squeeze(1)
-                                if ref_imgs.dim() == 3:
-                                    ref_imgs = ref_imgs.unsqueeze(1).repeat(1, 3, 1, 1)
-                        else:
-                            ref_imgs = test_batch
+                            print(f"[Test] ERROR: No target_image/GT/GT_w in batch, keys: {list(batch.keys())}")
+                            continue
                         
-                        # 转换为训练格式的batch（需要添加 mixed_3d_landmarks）
+                        # 获取GT（用于保存对比）
+                        if 'GT_w' in batch:
+                            gt = batch['GT_w']
+                        elif 'GT' in batch:
+                            gt = batch['GT']
+                        else:
+                            gt = target  # 如果没有GT，使用target作为参考
+                        
+                        batch_size = target.shape[0]
+                    elif isinstance(batch, (list, tuple)):
+                        # 旧格式：(images, ...)
+                        print(f"[Test] Using legacy batch format")
+                        target = batch[0].to(self.device) if isinstance(batch[0], torch.Tensor) else batch[0]
+                        gt = target
+                        batch_size = target.shape[0]
+                        
+                        # 转换为字典格式
                         batch = {
-                            'GT': test_batch,
-                            'inpaint_image': inpaint_image,
-                            'inpaint_mask': inpaint_mask,
-                            'ref_imgs': ref_imgs,
-                            'GT_w': test_batch,
-                            'GT_l': test_batch,
-                            'mixed_3d_landmarks': torch.zeros_like(test_batch),  # 旧格式没有3D landmarks，用零张量
+                            'target_image': target,
+                            'GT_w': gt,
+                            'inpaint_image': batch[1].to(self.device) if len(batch) > 1 else target,
+                            'inpaint_mask': batch[2].to(self.device) if len(batch) > 2 else torch.ones_like(target[:, :1]),
+                            'ref_imgs': batch[3].to(self.device) if len(batch) > 3 else target,
+                            'mixed_3d_landmarks': torch.zeros_like(target)
                         }
                     else:
-                        print(f"[Test] Unknown batch format, skipping")
+                        print(f"[Test] ERROR: Unknown batch type: {type(batch)}")
                         continue
-                    
-                    batch_size = batch['GT'].shape[0]
                     remaining = num_samples - samples_generated
                     if remaining < batch_size:
                         # 只处理需要的数量
+                        target = target[:remaining]
+                        gt = gt[:remaining]
                         for key in batch:
                             if isinstance(batch[key], torch.Tensor):
                                 batch[key] = batch[key][:remaining]
                         batch_size = remaining
                     
-                    # 获取输入（参考inference_test_bench.py的处理方式）
-                    test_batch = batch['GT'].to(self.device)
+                    # ⭐ 核心推理逻辑（13通道模型）
+                    # 1. 准备输入数据
+                    # - target: 目标图像（提供姿态和背景）- 推理的真正输入
+                    # - gt: ground truth（用于对比和评估）
+                    # - inpaint_image/mask: 用于构造13通道的前4通道
+                    # - ref_imgs: 参考人脸（提供身份信息）
+                    inpaint_image = batch['inpaint_image']  # masked图像
+                    inpaint_mask = batch['inpaint_mask']  # mask
+                    ref_imgs = batch['ref_imgs']  # 参考人脸
+                    mixed_3d_landmarks = batch.get('mixed_3d_landmarks', torch.zeros_like(target))  # 3D landmarks
                     
-                    # ⭐ 13通道模型需要 mixed_3d_landmarks
-                    # 测试数据集不提供3D landmarks，使用零张量代替（简化处理）
-                    # 注：完整推理时应使用真实的3D landmarks生成
-                    if 'mixed_3d_landmarks' not in batch:
-                        batch['mixed_3d_landmarks'] = torch.zeros_like(test_batch)  # [B, 3, H, W]
-                    
-                    test_model_kwargs = {
-                        'inpaint_image': batch['inpaint_image'].to(self.device),
-                        'inpaint_mask': batch['inpaint_mask'].to(self.device),
-                        'ref_imgs': batch['ref_imgs'].to(self.device),
-                        'mixed_3d_landmarks': batch['mixed_3d_landmarks'].to(self.device)  # 新增
-                    }
-                    
-                    # 处理 unconditional_conditioning (uc)（参考inference_test_bench.py第498-512行）
-                    # 获取测试时的scale参数（默认与推理时保持一致，scale=3.0）
-                    test_scale = getattr(self, 'test_guidance_scale', 3.0)
-                    uc = None
-                    if test_scale != 1.0:
-                        uc = self.learnable_vector.repeat(test_batch.shape[0], 1, 1)
-                        if hasattr(self, 'stack_feat') and self.stack_feat:
-                            uc2 = self.other_learnable_vector.repeat(test_batch.shape[0], 1, 1)
-                            uc = torch.cat([uc, uc2], dim=-1)
-                    
-                    # 获取条件（参考inference_test_bench.py第506-518行）
-                    landmarks = self.get_landmarks(test_batch) if (self.Landmark_cond or self.Landmark_loss_weight > 0) else None
-                    
-                    # 处理ref_imgs的维度
-                    ref_imgs_for_cond = test_model_kwargs['ref_imgs']
-                    if ref_imgs_for_cond.dim() == 5:  # [B, 1, 3, H, W]
-                        ref_imgs_for_cond = ref_imgs_for_cond.squeeze(1)  # [B, 3, H, W]
-                    elif ref_imgs_for_cond.dim() == 4 and ref_imgs_for_cond.shape[1] == 1:  # [B, 1, H, W]
-                        ref_imgs_for_cond = ref_imgs_for_cond.squeeze(1)  # [B, H, W]
-                        if ref_imgs_for_cond.dim() == 3:
-                            ref_imgs_for_cond = ref_imgs_for_cond.unsqueeze(1).repeat(1, 3, 1, 1)  # [B, 3, H, W]
-                    
-                    c = self.conditioning_with_feat(
-                        ref_imgs_for_cond.to(torch.float32),
-                        landmarks=landmarks,
-                        tar=test_batch.to(torch.float32)
-                    ).float()
-                    
-                    if c.shape[-1] == 1024 and hasattr(self, 'proj_out'):
-                        c = self.proj_out(c)
-                    if len(c.shape) == 2:
-                        c = c.unsqueeze(1)
-                    
-                    # 处理landmarks和uc（如果需要，参考inference_test_bench.py第508-512行）
-                    if (hasattr(self, 'land_mark_id_seperate_layers') and self.land_mark_id_seperate_layers) or \
-                       (hasattr(self, 'sep_head_att') and self.sep_head_att):
-                        if test_scale != 1.0 and landmarks is not None:
-                            landmarks_expanded = landmarks.unsqueeze(1) if len(landmarks.shape) != 3 else landmarks
-                            uc = torch.cat([uc, landmarks_expanded], dim=-1)
-                    
-                    # ⭐ 13通道模型：像训练时 get_input 一样准备完整的 13 通道输入
-                    # 编码 inpaint_image
-                    inpaint_image = test_model_kwargs['inpaint_image']
-                    inpaint_mask = test_model_kwargs['inpaint_mask']
-                    z_inpaint = self.encode_first_stage(inpaint_image)
-                    z_inpaint = self.get_first_stage_encoding(z_inpaint).detach()
+                    # 2. 编码inpaint和landmarks到latent空间
+                    z_inpaint = self.get_first_stage_encoding(self.encode_first_stage(inpaint_image)).detach()
                     mask_resize = Resize([z_inpaint.shape[-1], z_inpaint.shape[-1]])(inpaint_mask)
                     
-                    # 编码 mixed_3d_landmarks（参考 get_input 第1490-1499行）
-                    mixed_3d_landmarks = test_model_kwargs['mixed_3d_landmarks']
-                    landmark_latent = None
+                    # Landmark编码
                     if hasattr(self, 'landmark_encoder') and mixed_3d_landmarks is not None:
-                        landmark_latent = self.landmark_encoder(mixed_3d_landmarks)  # [B, 4, 64, 64]
-                    # 兜底：如果没有编码器或数据，使用零张量
-                    if landmark_latent is None:
-                        landmark_latent = torch.zeros_like(z_inpaint)  # [B, 4, 64, 64]
+                        landmark_latent = self.landmark_encoder(mixed_3d_landmarks)
+                    else:
+                        landmark_latent = torch.zeros_like(z_inpaint)
                     
-                    # 构造 rest: 拼接 z_inpaint(4) + mask(1) + landmark_latent(4) = 9 通道
-                    # 参考 get_input 第1501-1502行的拼接方式
-                    # 注意：在 ddim 采样时，x 是 [B, 4, 64, 64]，会和 rest 拼接成 [B, 13, 64, 64]
+                    # 构造rest（后9通道）
                     rest = torch.cat([z_inpaint, mask_resize, landmark_latent], dim=1)  # [B, 9, 64, 64]
                     
-                    # 生成样本（参考inference_test_bench.py第528-538行）
-                    from ldm.models.diffusion.ddim import DDIMSampler
-                    sampler = DDIMSampler(self)
+                    # 3. 准备条件（CLIP + ID + Landmark）
+                    # ⭐ 使用target获取landmarks和conditioning（因为我们要生成target的姿态）
+                    landmarks_2d = self.get_landmarks(target) if (self.Landmark_cond or self.Landmark_loss_weight > 0) else None
                     
+                    c = self.conditioning_with_feat(
+                        ref_imgs.to(torch.float32),
+                        landmarks=landmarks_2d,
+                        tar=target.to(torch.float32)
+                    ).float()
+                    
+                    # 4. 准备unconditional conditioning（用于classifier-free guidance）
+                    uc = None
+                    if test_scale != 1.0:
+                        uc = self.learnable_vector.repeat(batch_size, 1, 1)
+                        if hasattr(self, 'stack_feat') and self.stack_feat:
+                            uc2 = self.other_learnable_vector.repeat(batch_size, 1, 1)
+                            uc = torch.cat([uc, uc2], dim=-1)
+                        
+                        # 如果使用分离的landmark层，也需要添加landmarks到uc
+                        if (hasattr(self, 'land_mark_id_seperate_layers') and self.land_mark_id_seperate_layers) or \
+                           (hasattr(self, 'sep_head_att') and self.sep_head_att):
+                            if landmarks_2d is not None:
+                                landmarks_expanded = landmarks_2d.unsqueeze(1) if len(landmarks_2d.shape) != 3 else landmarks_2d
+                                uc = torch.cat([uc, landmarks_expanded], dim=-1)
+                    
+                    # 5. DDIM采样
+                    # ⭐ 使用target作为姿态参考（我们要将ref_imgs的身份换到target的姿态上）
                     shape = [self.channels, self.image_size, self.image_size]
-                    start_code = None  # 不使用固定起始噪声
-                    
-                    samples_ddim, intermediates = sampler.sample(
-                        S=self.test_ddim_steps,  # ddim_steps（参考inference_test_bench.sh，默认50）
+                    samples_ddim, _ = sampler.sample(
+                        S=test_ddim_steps,
                         conditioning=c,
                         batch_size=batch_size,
                         shape=shape,
                         verbose=False,
-                        unconditional_guidance_scale=test_scale,  # 使用测试时的scale参数（参考inference_test_bench.sh，默认3.0）
+                        unconditional_guidance_scale=test_scale,
                         unconditional_conditioning=uc,
-                        eta=0.0,  # ddim_eta
-                        x_T=start_code,
-                        log_every_t=100,
-                        rest=rest,  # ⭐ 13通道：直接传递 rest，ddim.py 会检测并拼接
-                        src_im=ref_imgs_for_cond.to(torch.float32),
-                        tar=test_batch.to(torch.float32)
+                        eta=0.0,
+                        x_T=None,
+                        rest=rest,  # ⭐ 13通道：传递后9通道
+                        src_im=ref_imgs.to(torch.float32),
+                        tar=target.to(torch.float32)
                     )
                     
-                    samples = samples_ddim
-                    
-                    # 解码并保存（参考inference_test_bench.py）
-                    x_samples = self.decode_first_stage(samples)
+                    # 6. 解码并保存
+                    x_samples = self.decode_first_stage(samples_ddim)
                     x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
                     
                     for i in range(batch_size):
                         img = x_samples[i].cpu().permute(1, 2, 0).numpy()
                         img = (img * 255).astype(np.uint8)
-                        # 使用segment_id_batch作为文件名（参考inference_test_bench.py）
-                        if 'segment_id_batch' in locals() and isinstance(segment_id_batch, (list, tuple)) and i < len(segment_id_batch):
-                            filename = f"{segment_id_batch[i]}.png"
-                        else:
-                            filename = f"{samples_generated + i:06d}.png"
-                        Image.fromarray(img).save(
-                            os.path.join(test_output_dir, filename)
-                        )
+                        filename = f"{samples_generated + i:06d}.png"
+                        Image.fromarray(img).save(os.path.join(test_output_dir, filename))
                     
                     samples_generated += batch_size
-                    # ⭐ 添加进度输出
-                    print(f"[Test] Progress: {samples_generated}/{num_samples} samples generated", end='\r')
-                    
-                    if samples_generated >= num_samples:
-                        print()  # 换行
-                        break
+                    print(f"[Test] Generated {samples_generated}/{num_samples} samples", end='\r')
             
-            print(f"\n[Test] ✅ Completed! Generated {samples_generated} samples, saved to {test_output_dir}")
+            print(f"\n[Test] ✅ Inference complete: {samples_generated} samples saved to {test_output_dir}")
             
-            # 5. 调用评估脚本计算指标
-            #try,防止显存不够
-            
+            # 计算指标
             self.calculate_test_metrics(test_output_dir, tmp_dir)
             
         except Exception as e:
-            print(f"[Test] Error during testing: {e}")
+            print(f"[Test] ERROR: {e}")
             import traceback
             traceback.print_exc()
     
@@ -3203,194 +2696,92 @@ class LatentDiffusion(DDPM):
         import subprocess
         import re
         
-        # 获取测试路径配置
-        dataset_name = getattr(self, 'test_dataset_name', 'celeba')
-        # 将数据集名称映射为ID_retrieval.py期望的格式（参考ID_retrieval.py第178-185行）
-        # ID_retrieval.py支持: "celeba", "ffhq", "ff++"
-        dataset_name_lower = dataset_name.lower() if dataset_name else 'celeba'
-        if dataset_name_lower == 'ffhq':
-            id_retrieval_dataset = 'ffhq'
-        elif dataset_name_lower == 'ff++':
-            id_retrieval_dataset = 'ff++'
-        else:
-            id_retrieval_dataset = 'celeba'  # 默认使用celeba
-        
-        source_path = getattr(self, 'test_source_path', None)
-        target_path = getattr(self, 'test_target_path', None)
-        source_mask_path = getattr(self, 'test_source_mask_path', None)
-        target_mask_path = getattr(self, 'test_target_mask_path', None)
-        
-        if not target_path:
-            print("[Test] test_target_path not configured, skipping metrics calculation")
-            return
-        
-        # 设置日志文件（保存在tmp目录下）
-        metrics_log_file = os.path.join(tmp_dir, f"test_metrics_step_{self.global_step}.txt")
-        
-        print(f"\n[Test] Calculating metrics, results will be saved to {metrics_log_file}")
-        
-        # 获取项目根目录
-        import pathlib
-        project_root = pathlib.Path(__file__).parent.parent.parent.parent
-        project_root_str = str(project_root)
-        
-        # 获取当前CUDA设备
-        if torch.cuda.is_available():
-            cuda_device = str(self.device.index if hasattr(self.device, 'index') and self.device.index is not None else 0)
-        else:
-            cuda_device = None
-        
-        metrics_results = {}
-        
-        # 构建基础命令前缀（参考ID_retrieval.py的命令格式）
-        def build_cmd_prefix(script_path):
-            """构建包含CUDA_VISIBLE_DEVICES和PYTHONPATH的命令前缀"""
-            cmd_parts = []
-            if cuda_device is not None:
-                cmd_parts.append(f"CUDA_VISIBLE_DEVICES={cuda_device}")
-            cmd_parts.append(f'PYTHONPATH="{project_root_str}:$PYTHONPATH"')
-            cmd_parts.append(f"python {script_path}")
-            return " \\\n    ".join(cmd_parts)
-        
-        # 1. 计算 Pose 距离
-        if target_path:
-            print("[Test] Calculating Pose distance...")
-            try:
-                pose_output_file = os.path.join(tmp_dir, f'test_pose_step_{self.global_step}.txt')
-                script_path = str(project_root / 'eval_tool' / 'Pose' / 'pose_compare.py')
-                cmd_prefix = build_cmd_prefix(script_path)
-                cmd_args = f"{target_path} {test_output_dir} --max-samples {getattr(self, 'test_num_samples', 200)} --output {pose_output_file} --device {'cuda' if torch.cuda.is_available() else 'cpu'}"
-                cmd = f"{cmd_prefix} \\\n    {cmd_args}"
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=project_root_str)
-                if result.returncode == 0:
-                    # 从输出文件读取结果
-                    if os.path.exists(pose_output_file):
-                        with open(pose_output_file, 'r') as f:
-                            content = f.read()
-                            match = re.search(r'Pose_value:\s*([\d.]+)', content)
-                            if match:
-                                pose_value = float(match.group(1))
-                                metrics_results['pose_distance'] = pose_value
-                                self.log('test/pose_distance', pose_value, on_step=True, prog_bar=True)
-                                print(f"[Test] Pose Distance: {pose_value:.4f}")
-                else:
-                    print(f"[Test] Pose calculation failed with return code {result.returncode}")
-                    print(f"[Test] Error: {result.stderr}")
-            except Exception as e:
-                print(f"[Test] Pose calculation failed: {e}")
-        
-        # 2. 计算 Expression 距离
-        if target_path:
-            print("[Test] Calculating Expression distance...")
-            try:
-                expr_output_file = os.path.join(tmp_dir, f'test_expression_step_{self.global_step}.txt')
-                script_path = str(project_root / 'eval_tool' / 'Expression' / 'expression_compare_face_recon.py')
-                cmd_prefix = build_cmd_prefix(script_path)
-                cmd_args = f"{target_path} {test_output_dir} --max-samples {getattr(self, 'test_num_samples', 200)} --output {expr_output_file} --device {'cuda' if torch.cuda.is_available() else 'cpu'}"
-                cmd = f"{cmd_prefix} \\\n    {cmd_args}"
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=project_root_str)
-                if result.returncode == 0:
-                    # 从输出文件读取结果
-                    if os.path.exists(expr_output_file):
-                        with open(expr_output_file, 'r') as f:
-                            content = f.read()
-                            match = re.search(r'Expression_value:\s*([\d.]+)', content)
-                            if match:
-                                expr_value = float(match.group(1))
-                                metrics_results['expression_distance'] = expr_value
-                                self.log('test/expression_distance', expr_value, on_step=True, prog_bar=True)
-                                print(f"[Test] Expression Distance: {expr_value:.4f}")
-                else:
-                    print(f"[Test] Expression calculation failed with return code {result.returncode}")
-                    print(f"[Test] Error: {result.stderr}")
-            except Exception as e:
-                print(f"[Test] Expression calculation failed: {e}")
-        
-        # 3. 计算 ID Retrieval（如果有mask路径）
-        if source_path and source_mask_path and target_mask_path:
-            print("[Test] Calculating ID Retrieval...")
-            try:
-                id_output_file = os.path.join(tmp_dir, f'test_id_step_{self.global_step}.txt')
-                script_path = str(project_root / 'eval_tool' / 'ID_retrieval' / 'ID_retrieval.py')
-                cmd_prefix = build_cmd_prefix(script_path)
-                cmd_args = f"{source_path} {test_output_dir} {source_mask_path} {target_mask_path} --max-samples {getattr(self, 'test_num_samples', 200)} --output {id_output_file} --arcface True --dataset {id_retrieval_dataset}"
-                cmd = f"{cmd_prefix} \\\n    {cmd_args}"
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=project_root_str)
-                if result.returncode == 0:
-                    # 从输出文件读取结果
-                    if os.path.exists(id_output_file):
-                        with open(id_output_file, 'r') as f:
-                            content = f.read()
-                            top1_match = re.search(r'Top-1 accuracy:\s*([\d.]+)%', content)
-                            top5_match = re.search(r'Top-5 accuracy:\s*([\d.]+)%', content)
-                            mean_match = re.search(r'Mean ID feat:\s*([\d.]+)', content)
-                            if top1_match:
-                                top1 = float(top1_match.group(1)) / 100.0
-                                metrics_results['id_top1'] = top1
-                                self.log('test/id_top1', top1, on_step=True, prog_bar=True)
-                                print(f"[Test] ID Top-1: {top1*100:.2f}%")
-                            if top5_match:
-                                top5 = float(top5_match.group(1)) / 100.0
-                                metrics_results['id_top5'] = top5
-                                self.log('test/id_top5', top5, on_step=True, prog_bar=True)
-                                print(f"[Test] ID Top-5: {top5*100:.2f}%")
-                            if mean_match:
-                                mean_id = float(mean_match.group(1))
-                                metrics_results['id_mean'] = mean_id
-                                self.log('test/id_mean', mean_id, on_step=True, prog_bar=True)
-                                print(f"[Test] ID Mean: {mean_id:.4f}")
-                else:
-                    print(f"[Test] ID Retrieval calculation failed with return code {result.returncode}")
-                    print(f"[Test] Error: {result.stderr}")
-            except Exception as e:
-                print(f"[Test] ID Retrieval calculation failed: {e}")
-        
-        # 4. 计算 FID（如果有数据集路径）
-        dataset_path = getattr(self, 'test_dataset_path', None)
-        if dataset_path and os.path.exists(dataset_path):
-            print("[Test] Calculating FID score...")
-            try:
-                fid_output_file = os.path.join(tmp_dir, f'test_fid_step_{self.global_step}.txt')
-                script_path = str(project_root / 'eval_tool' / 'fid' / 'fid_score.py')
-                cmd_prefix = build_cmd_prefix(script_path)
-                cmd_args = f"{dataset_path} {test_output_dir} --max-samples {getattr(self, 'test_num_samples', 200)} --output {fid_output_file} --device {'cuda' if torch.cuda.is_available() else 'cpu'}"
-                cmd = f"{cmd_prefix} \\\n    {cmd_args}"
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=project_root_str)
-                if result.returncode == 0:
-                    # 从输出文件读取结果
-                    if os.path.exists(fid_output_file):
-                        with open(fid_output_file, 'r') as f:
-                            content = f.read()
-                            # 匹配 "FID Score:" 或 "FID score:"（大小写不敏感）
-                            match = re.search(r'FID\s+[Ss]core:\s*([\d.]+)', content, re.IGNORECASE)
-                            if match:
-                                fid_value = float(match.group(1))
-                                metrics_results['fid'] = fid_value
-                                self.log('test/fid', fid_value, on_step=True, prog_bar=True)
-                                print(f"[Test] FID Score: {fid_value:.4f}")
-                            else:
-                                print(f"[Test] Failed to parse FID score from output file")
-                                print(f"[Test] File content preview: {content[:200]}")
-                else:
-                    print(f"[Test] FID calculation failed with return code {result.returncode}")
-                    print(f"[Test] Error: {result.stderr}")
-            except Exception as e:
-                print(f"[Test] FID calculation failed: {e}")
-        
-        # 5. 保存汇总结果到日志文件
-        with open(metrics_log_file, 'w', encoding='utf-8') as f:
-            f.write(f"Test Metrics at Step {self.global_step}\n")
-            f.write("="*60 + "\n\n")
-            for key, value in metrics_results.items():
-                f.write(f"{key}: {value:.6f}\n")
-            f.write("\n" + "="*60 + "\n")
-        
-        # 6. 记录到 wandb（类似 log_images 的方式）
-        self.log_test_metrics_to_wandb(metrics_results)
-        
-        print(f"\n[Test] All metrics calculated. Summary saved to {metrics_log_file}")
-        print(f"[Test] Metrics: {metrics_results}\n")
+        try:
+            print(f"\n[Test] Calculating metrics...")
+            
+            # 获取测试数据集配置
+            dataset_name = getattr(self, 'test_dataset_name', 'celeba').lower()
+            
+            # 构造评估命令（参考 evaluate_samples.py）
+            cmd = [
+                "python", "evaluate_samples.py",
+                "--result_folder", test_output_dir,
+                "--dataset", dataset_name
+            ]
+            
+            # 如果配置中有test_dataset_path，添加GT路径
+            if hasattr(self, 'test_dataset_path'):
+                cmd.extend(["--gt_folder", self.test_dataset_path])
+            
+            print(f"[Test] Running: {' '.join(cmd)}")
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600  # 10分钟超时
+            )
+            
+            if result.returncode == 0:
+                print(f"[Test] ✅ Metrics calculation complete")
+                print(result.stdout)
+                
+                # 解析指标并记录到wandb
+                self.log_metrics_to_wandb(result.stdout)
+            else:
+                print(f"[Test] ⚠️ Metrics calculation failed:")
+                print(result.stderr)
+                
+        except Exception as e:
+            print(f"[Test] ⚠️ Failed to calculate metrics: {e}")
     
+    def log_metrics_to_wandb(self, metrics_output):
+        """解析并记录指标到wandb"""
+        try:
+            if not hasattr(self, 'logger') or self.logger is None:
+                return
+            
+            # 简单解析metrics输出（根据实际evaluate_samples.py的输出格式调整）
+            metrics = {}
+            for line in metrics_output.split('\n'):
+                if ':' in line:
+                    parts = line.split(':')
+                    if len(parts) == 2:
+                        key = parts[0].strip().lower().replace(' ', '_')
+                        try:
+                            value = float(parts[1].strip())
+                            metrics[f"test/{key}"] = value
+                        except:
+                            pass
+            
+            if metrics:
+                self.logger.log_metrics(metrics, step=self.global_step)
+                print(f"[Test] ✅ Logged {len(metrics)} metrics to wandb")
+                
+        except Exception as e:
+            print(f"[Test] ⚠️ Failed to log metrics to wandb: {e}")
+
+
+    def sample_initial(self,cond,batch_size,ddim, ddim_steps,**kwargs):
+        if ddim:
+            ddim_sampler = DDIMSampler(self)
+            shape = (self.channels, self.image_size, self.image_size)
+            samples, intermediates =ddim_sampler.sample(ddim_steps,batch_size,
+                                                        shape,cond,verbose=False,**kwargs)
+
+        else:
+            samples, intermediates = self.sample(cond=cond, batch_size=batch_size,
+                                                 return_intermediates=True,**kwargs)
+
+        return samples, intermediates
+    
+    @rank_zero_only
+    @torch.no_grad()
+    def run_test_during_training_old(self):
+        """旧版本的test_during_training，已弃用"""
+        pass
+    
+    
+    @rank_zero_only
     def log_test_metrics_to_wandb(self, metrics_results):
         """将测试指标记录到 wandb，类似 log_images 的方式"""
         if not metrics_results:
@@ -3444,7 +2835,7 @@ class LatentDiffusion(DDPM):
     @torch.no_grad()
     def log_images(self, batch, N=4, sample=True, ddim_steps=50, ddim_eta=1., return_keys=None, **kwargs):
         """
-        记录SFT或DPO训练的关键图片
+        记录SFT训练的关键图片（13通道版本）
         
         Args:
             batch: 数据批次
@@ -3455,22 +2846,20 @@ class LatentDiffusion(DDPM):
             
         Returns:
             log: 包含以下内容的字典
-                - ref_imgs: 参考人脸（已mask）
-                - tgt: 目标图像
-                - tgt_mask: 目标mask
-                - x_w: 赢样本（好的换脸结果）
-                - output_current: 当前训练模型（EMA）生成的输出（可选）
-                - output_reference: 参考模型生成的输出（可选，仅DPO模式）
+                - concatenated: 拼接的可视化图像（竖向排列）
+                  包括：参考人脸（已mask）、目标图像、masked目标、GT、模型输出
         """
-        mode = "DPO" if self.model_ref is not None else "SFT"
-        print(f"[{mode} log_images] Called at step {self.global_step}, N={N}, sample={sample}")
+        print(f"[SFT log_images] Called at step {self.global_step}, N={N}, sample={sample}")
         
         try:
             use_ddim = ddim_steps is not None
             log = dict()
             
-            print(f"[{mode} log_images] Getting input data...")
-            z, _, c, x_w, x_l, xrec_w, xrec_l, reference, mask, _, gt, inpaint_src = self.get_input(
+            print(f"[SFT log_images] Getting input data...")
+            # ⭐ 修改：匹配当前 get_input 的返回值
+            # 返回: [z_new_w, c_shared, x_w, xrec_w, reference, mask, reference, gt]
+            # 注意：不需要 get_inpaint，直接用 batch 中的数据
+            result = self.get_input(
                 batch, self.first_stage_key,
                 return_first_stage_outputs=True,
                 force_c_encode=True,
@@ -3478,17 +2867,22 @@ class LatentDiffusion(DDPM):
                 get_mask=True,
                 get_reference=True,
                 get_gt=True,
-                get_inpaint=True,
                 bs=N
             )
+            
+            # 解包返回值（共8个）
+            z, c, x_w, xrec_w, reference, mask, _, gt = result
 
+            # ⭐ 从 batch 中获取 inpaint_image（masked的目标图像）
+            inpaint_src = batch['inpaint_image'][:N].to(self.device)
+            
             N = min(x_w.shape[0], N)
             
             # 收集所有需要拼接的图像
             images_to_concat = []
             target_size = 512  # 统一尺寸
             
-            # 1. 参考图像（已mask）
+            # 1. 参考图像（已mask，用于ID提取）
             if reference is not None:
                 ref_normalized = un_norm_clip(reference)
                 ref_normalized = TF.normalize(ref_normalized, 
@@ -3497,65 +2891,45 @@ class LatentDiffusion(DDPM):
                 ref_resized = TF.resize(ref_normalized, (target_size, target_size))
                 images_to_concat.append(ref_resized)
             
-            # 2. 目标图像
+            # 2. 目标图像（完整的GT）
             tgt_resized = TF.resize(gt, (target_size, target_size))
             images_to_concat.append(tgt_resized)
             
-            # 3. mask后的目标图像（直接使用数据集提供的inpaint_src）
+            # 3. mask后的目标图像（inpaint任务的输入）
             tgt_masked_resized = TF.resize(inpaint_src, (target_size, target_size))
             images_to_concat.append(tgt_masked_resized)
             
-            # 4. 赢样本
+            # 4. GT样本（x_w，训练目标）
             x_w_resized = TF.resize(x_w, (target_size, target_size))
             images_to_concat.append(x_w_resized)
             
-            print(f"[{mode} log_images] Added 4 base images (ref_imgs, tgt, tgt_mask, x_w)")
+            print(f"[SFT log_images] Added 4 base images (ref_masked, gt_full, gt_masked, gt_target)")
 
-            # 生成模型输出
+            # 生成模型输出（仅SFT模式）
             if sample:
-                print(f"[{mode} log_images] Generating model outputs...")
+                print(f"[SFT log_images] Generating model output...")
                 
                 # 5. 使用当前训练模型（EMA）生成
-                print(f"[{mode} log_images] Sampling with current model (EMA)...")
+                print(f"[SFT log_images] Sampling with EMA model...")
                 with self.ema_scope("Plotting"):
-                    if self.first_stage_key == 'inpaint':
-                        samples_current, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
-                                                    ddim_steps=ddim_steps, eta=ddim_eta, rest=z[:, 4:, :, :])
-                    else:
-                        samples_current, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
-                                                    ddim_steps=ddim_steps, eta=ddim_eta)
+                    # ⭐ 13通道模型：传递 rest（z的后9通道：z_inpaint(4) + mask(1) + landmark(4)）
+                    samples_current, _ = self.sample_log(
+                        cond=c, 
+                        batch_size=N, 
+                        ddim=use_ddim,
+                        ddim_steps=ddim_steps, 
+                        eta=ddim_eta, 
+                        rest=z[:, 4:, :, :]  # 后9通道
+                    )
                 x_samples_current = self.decode_first_stage(samples_current)
                 x_samples_current_resized = TF.resize(x_samples_current, (target_size, target_size))
                 images_to_concat.append(x_samples_current_resized)
-                print(f"[{mode} log_images] Added current model output")
-                
-                # 6. 使用参考模型生成（仅在DPO模式下）
-                if self.model_ref is not None:
-                    print(f"[DPO log_images] Sampling with reference model...")
-                    # 临时替换模型为参考模型
-                    model_backup = self.model
-                    self.model = self.model_ref
-                    try:
-                        if self.first_stage_key == 'inpaint':
-                            samples_ref, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
-                                                        ddim_steps=ddim_steps, eta=ddim_eta, rest=z[:, 4:, :, :])
-                        else:
-                            samples_ref, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,
-                                                        ddim_steps=ddim_steps, eta=ddim_eta)
-                        x_samples_ref = self.decode_first_stage(samples_ref)
-                        x_samples_ref_resized = TF.resize(x_samples_ref, (target_size, target_size))
-                        images_to_concat.append(x_samples_ref_resized)
-                        print(f"[DPO log_images] Added reference model output")
-                    finally:
-                        # 恢复原模型
-                        self.model = model_backup
-                else:
-                    print(f"[SFT log_images] Skipping reference model (SFT mode)")
-                    
+                print(f"[SFT log_images] Added model output (total {len(images_to_concat)} images)")
             else:
-                print(f"[{mode} log_images] Skipping model output (sample={sample})")
+                print(f"[SFT log_images] Skipping model output (sample={sample})")
 
             # 竖着拼接所有图像 (每个样本单独拼接)
+            # 格式：[参考人脸mask, GT完整, GT_mask, GT目标, 模型输出] 每个512x512，竖向排列
             concatenated_images = []
             for i in range(N):
                 sample_images = [img[i:i+1] for img in images_to_concat]  # 取第i个样本
@@ -3566,7 +2940,11 @@ class LatentDiffusion(DDPM):
             # 合并所有样本 [N, 3, H*n, W]
             log["concatenated"] = torch.cat(concatenated_images, dim=0)
             
-            print(f"[{mode} log_images] Successfully created concatenated image with {len(images_to_concat)} rows x {N} samples")
+            print(f"[SFT log_images] Successfully created concatenated image:")
+            print(f"  - {len(images_to_concat)} rows (ref_masked, gt_full, gt_masked, gt_target" + 
+                  (", model_output" if sample else "") + ")")
+            print(f"  - {N} samples")
+            print(f"  - Shape: {log['concatenated'].shape}")
             
             if return_keys:
                 if np.intersect1d(list(log.keys()), return_keys).shape[0] == 0:
@@ -3576,7 +2954,7 @@ class LatentDiffusion(DDPM):
             return log
             
         except Exception as e:
-            print(f"[{mode} log_images] ERROR: {e}")
+            print(f"[SFT log_images] ERROR: {e}")
             import traceback
             traceback.print_exc()
             return {}
